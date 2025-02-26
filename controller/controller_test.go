@@ -88,6 +88,7 @@ const (
 	TestDeploymentName = "test-deployment"
 
 	TestBackupTarget     = "s3://backupbucket@us-east-1/backupstore"
+	TestBackupTargetName = "default"
 	TestBackupVolumeName = "test-backup-volume-for-restoration"
 	TestBackupName       = "test-backup-for-restoration"
 
@@ -112,6 +113,8 @@ const (
 	TestKernelVersion        = "6.2.0-32-generic"
 	TestKernelConfigDIR      = "/host/boot"
 	TestKernelConfigFilePath = TestKernelConfigDIR + "/config-" + TestKernelVersion
+	TestSystemEtcDIR         = "/host/etc"
+	TestNFSMountConfigPath   = TestSystemEtcDIR + "/nfsmount.conf"
 )
 
 var (
@@ -458,6 +461,15 @@ func newStorageClass(name, provisioner string) *storagev1.StorageClass {
 			Name: name,
 		},
 		Provisioner: provisioner,
+	}
+}
+
+func newSnapshot(name string) *longhorn.Snapshot {
+	return &longhorn.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: TestNamespace,
+		},
 	}
 }
 

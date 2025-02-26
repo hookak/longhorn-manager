@@ -41,7 +41,9 @@ const (
 
 const (
 	WaitForSnapshotMessage                 = "Waiting for the snapshot %v to be ready"
+	FailedWaitingForSnapshotMessage        = "Failed waiting for the snapshot %v to be ready"
 	WaitForEngineMessage                   = "Waiting for the engine %v to be ready"
+	FailedWaitingForEngineMessage          = "Failed waiting for the engine %v to be ready"
 	WaitForBackupDeletionIsCompleteMessage = "Wait for backup %v to be deleted"
 	FailedToGetSnapshotMessage             = "Failed to get the Snapshot %v"
 	FailedToDeleteBackupMessage            = "Failed to delete the backup %v in the backupstore, err %v"
@@ -51,6 +53,10 @@ const (
 const (
 	DeletionMinInterval = time.Minute * 1
 	DeletionMaxInterval = time.Hour * 24
+
+	creationRetryCounterExpiredDuration = 10 * time.Minute
+	creationRetryCounterGCDuration      = 45 * time.Second
+	maxCreationRetry                    = 5
 )
 
 type DeletingStatus struct {
@@ -83,7 +89,8 @@ type BackupController struct {
 	deletingMapLock       sync.Mutex
 	inProgressDeletingMap map[string]*DeletingStatus
 
-	deletingBackoff *flowcontrol.Backoff
+	deletingBackoff      *flowcontrol.Backoff
+	creationRetryCounter *util.TimedCounter
 }
 
 func NewBackupController(
@@ -121,7 +128,8 @@ func NewBackupController(
 		deletingMapLock:       sync.Mutex{},
 		inProgressDeletingMap: map[string]*DeletingStatus{},
 
-		deletingBackoff: flowcontrol.NewBackOff(DeletionMinInterval, DeletionMaxInterval),
+		deletingBackoff:      flowcontrol.NewBackOff(DeletionMinInterval, DeletionMaxInterval),
+		creationRetryCounter: util.NewTimedCounter(creationRetryCounterExpiredDuration),
 	}
 
 	var err error
@@ -164,6 +172,7 @@ func (bc *BackupController) Run(workers int, stopCh <-chan struct{}) {
 	for i := 0; i < workers; i++ {
 		go wait.Until(bc.worker, time.Second, stopCh)
 	}
+	go bc.creationRetryCounter.RunGC(creationRetryCounterGCDuration, stopCh)
 	<-stopCh
 }
 
@@ -277,17 +286,23 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 
 	log := getLoggerForBackup(bc.logger, backup)
 
-	// Get default backup target
-	backupTarget, err := bc.ds.GetBackupTargetRO(types.DefaultBackupTargetName)
+	// Get BackupTarget CR
+	backupTargetName := ""
+	backupTarget, err := bc.getBackupTarget(backup)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
+		return err
+	}
+	if backupTarget == nil {
+		if backup.DeletionTimestamp.IsZero() {
+			return fmt.Errorf("backup target is nil for backup %v", backupName)
 		}
-		return errors.Wrapf(err, "failed to get the backup target %v", types.DefaultBackupTargetName)
+		backupTargetName = backup.Labels[types.LonghornLabelBackupTarget]
+	} else {
+		backupTargetName = backupTarget.Name
 	}
 
 	// Find the backup volume name from label
-	backupVolumeName, err := bc.getBackupVolumeName(backup)
+	canonicalBackupVolumeName, err := bc.getBackupVolumeName(backup)
 	if err != nil {
 		if types.ErrorIsNotFound(err) {
 			return nil // Ignore error to prevent enqueue
@@ -301,11 +316,11 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 
 	// Examine DeletionTimestamp to determine if object is under deletion
 	if !backup.DeletionTimestamp.IsZero() {
-		if err := bc.handleAttachmentTicketDeletion(backup, backupVolumeName); err != nil {
+		if err := bc.handleAttachmentTicketDeletion(backup, canonicalBackupVolumeName); err != nil {
 			return err
 		}
 
-		backupVolume, err := bc.ds.GetBackupVolume(backupVolumeName)
+		backupVolume, err := bc.ds.GetBackupVolumeByBackupTargetAndVolume(backupTargetName, canonicalBackupVolumeName)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -314,26 +329,24 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 		if err != nil {
 			return errors.Wrap(err, "failed to check if it needs to delete remote backup data")
 		}
-
 		if needsCleanupRemoteData && backupVolume != nil && backupVolume.DeletionTimestamp == nil {
 			backupTargetClient, err := newBackupTargetClientFromDefaultEngineImage(bc.ds, backupTarget)
 			if err != nil {
 				log.WithError(err).Warn("Failed to init backup target clients")
 				return nil // Ignore error to prevent enqueue
 			}
-			backupURL := backupstore.EncodeBackupURL(backup.Name, backupVolumeName, backupTargetClient.URL)
-
-			backupDeleted := bc.handleBackupDeletionInBackupStore(backup, backupVolumeName, backupURL, backupTargetClient)
+			backupURL := backupstore.EncodeBackupURL(backup.Name, canonicalBackupVolumeName, backupTargetClient.URL)
+			backupDeleted := bc.handleBackupDeletionInBackupStore(backup, canonicalBackupVolumeName, backupURL, backupTargetClient)
 			if !backupDeleted {
 				return nil
 			}
 		}
 
 		// Request backup_volume_controller to reconcile BackupVolume immediately if it's the last backup
-		if backupVolume != nil && backupVolume.Status.LastBackupName == backup.Name {
+		if backupVolume != nil && backupVolume.DeletionTimestamp == nil && backupVolume.Status.LastBackupName == backup.Name {
 			backupVolume.Spec.SyncRequestedAt = metav1.Time{Time: time.Now().UTC()}
 			if _, err = bc.ds.UpdateBackupVolume(backupVolume); err != nil && !apierrors.IsConflict(errors.Cause(err)) {
-				log.WithError(err).Errorf("Failed to update backup volume %s spec", backupVolumeName)
+				log.WithError(err).Errorf("Failed to update backup volume %s/%s spec", backupVolume.Name, canonicalBackupVolumeName)
 				// Do not return err to enqueue since backup_controller is responsible to
 				// reconcile Backup CR spec, waits the backup_volume_controller next reconcile time
 				// to update it's BackupVolume CR status
@@ -342,6 +355,8 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 
 		// Disable monitor regardless of backup state
 		bc.disableBackupMonitor(backup.Name)
+
+		bc.creationRetryCounter.DeleteEntry(backup.Name)
 
 		if backup.Status.State == longhorn.BackupStateError || backup.Status.State == longhorn.BackupStateUnknown {
 			bc.eventRecorder.Eventf(backup, corev1.EventTypeWarning, string(backup.Status.State), "Failed backup %s has been deleted: %s", backup.Name, backup.Status.Error)
@@ -374,7 +389,7 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 		}
 
 		if bc.backupInFinalState(backup) && (!backup.Status.LastSyncedAt.IsZero() || backup.Spec.SnapshotName == "") {
-			err = bc.handleAttachmentTicketDeletion(backup, backupVolumeName)
+			err = bc.handleAttachmentTicketDeletion(backup, canonicalBackupVolumeName)
 		}
 		if reflect.DeepEqual(existingBackup.Status, backup.Status) {
 			return
@@ -386,8 +401,8 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 			return
 		}
 		if backup.Status.State == longhorn.BackupStateCompleted && existingBackupState != backup.Status.State {
-			if err := bc.syncBackupVolume(backupVolumeName); err != nil {
-				log.Warnf("failed to sync Backup Volume: %v", backupVolumeName)
+			if err := bc.syncBackupVolume(backupTargetName, canonicalBackupVolumeName); err != nil {
+				log.Warnf("failed to sync backup volume %v for backup target %v", canonicalBackupVolumeName, backupTargetName)
 				return
 			}
 		}
@@ -401,7 +416,7 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 	// exists in the remote backup target before the CR creation.
 	// What the controller needs to do for this case is retrieve the info from the remote backup target.
 	if backup.Status.LastSyncedAt.IsZero() && backup.Spec.SnapshotName != "" && !bc.backupInFinalState(backup) {
-		volume, err := bc.ds.GetVolume(backupVolumeName)
+		volume, err := bc.ds.GetVolume(canonicalBackupVolumeName)
 		if err != nil {
 			if !apierrors.IsNotFound(err) {
 				return err
@@ -414,7 +429,7 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 			return nil // Ignore error to prevent enqueue
 		}
 
-		if err := bc.handleAttachmentTicketCreation(backup, backupVolumeName); err != nil {
+		if err := bc.handleAttachmentTicketCreation(backup, canonicalBackupVolumeName); err != nil {
 			return err
 		}
 
@@ -422,8 +437,11 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 			bc.syncBackupStatusWithSnapshotCreationTimeAndVolumeSize(volume, backup)
 		}
 
-		if err := bc.backupBackingImage(volume); err != nil {
-			return err
+		// v2 backing image currently doesn't support backup
+		if types.IsDataEngineV1(volume.Spec.DataEngine) {
+			if err := bc.backupBackingImage(volume); err != nil {
+				return err
+			}
 		}
 
 		monitor, err := bc.checkMonitor(backup, volume, backupTarget)
@@ -468,7 +486,7 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 		return nil // Ignore error to prevent enqueue
 	}
 
-	backupURL := backupstore.EncodeBackupURL(backup.Name, backupVolumeName, backupTargetClient.URL)
+	backupURL := backupstore.EncodeBackupURL(backup.Name, canonicalBackupVolumeName, backupTargetClient.URL)
 	backupInfo, err := backupTargetClient.BackupGet(backupURL, backupTargetClient.Credential)
 	if err != nil && !types.ErrorIsNotFound(err) {
 		if !types.ErrorIsInProgress(err) {
@@ -486,6 +504,7 @@ func (bc *BackupController) reconcile(backupName string) (err error) {
 	delete(backupInfo.Labels, types.VolumeRecurringJobInfoLabel)
 
 	// Update Backup CR status
+	backup.Status.BackupTargetName = backupTargetName
 	backup.Status.State = longhorn.BackupStateCompleted
 	backup.Status.URL = backupInfo.URL
 	backup.Status.SnapshotName = backupInfo.SnapshotName
@@ -614,12 +633,44 @@ func (bc *BackupController) isResponsibleFor(b *longhorn.Backup, defaultEngineIm
 	return isPreferredOwner || continueToBeOwner || requiresNewOwner, nil
 }
 
+func (bc *BackupController) getBackupTarget(backup *longhorn.Backup) (*longhorn.BackupTarget, error) {
+	backupTargetName, err := bc.getBackupTargetName(backup)
+	if err != nil {
+		return nil, err
+	}
+	backupTarget, err := bc.ds.GetBackupTargetRO(backupTargetName)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return nil, errors.Wrapf(err, "failed to get the backup target %v", backupTargetName)
+	}
+	if backupTarget == nil && backup.DeletionTimestamp == nil {
+		return nil, fmt.Errorf("Failed to find the backup target %v for the backup %v", backupTargetName, backup.Name)
+	}
+
+	return backupTarget, nil
+}
+
+func (bc *BackupController) getBackupTargetName(backup *longhorn.Backup) (string, error) {
+	backupTargetName, ok := backup.Labels[types.LonghornLabelBackupTarget]
+	if !ok {
+		snapshot, err := bc.ds.GetSnapshot(backup.Spec.SnapshotName)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to get the snapshot %v of the backup %v", backup.Spec.SnapshotName, backup.Name)
+		}
+		volume, err := bc.ds.GetVolume(snapshot.Spec.Volume)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to get the volume %v of the snapshot %v of the backup %v", snapshot.Spec.Volume, snapshot.Name, backup.Name)
+		}
+		backupTargetName = volume.Spec.BackupTargetName
+	}
+	return backupTargetName, nil
+}
+
 func (bc *BackupController) getBackupVolumeName(backup *longhorn.Backup) (string, error) {
-	backupVolumeName, ok := backup.Labels[types.LonghornLabelBackupVolume]
+	volumeName, ok := backup.Labels[types.LonghornLabelBackupVolume]
 	if !ok {
 		return "", fmt.Errorf("cannot find the backup volume label")
 	}
-	return backupVolumeName, nil
+	return volumeName, nil
 }
 
 func (bc *BackupController) getEngineBinaryClient(volumeName string) (*engineapi.EngineBinary, error) {
@@ -674,7 +725,11 @@ func (bc *BackupController) backupBackingImage(volume *longhorn.Volume) error {
 		return errors.Wrapf(err, "failed to get backing image %v", biName)
 	}
 
-	bbi, err := bc.ds.GetBackupBackingImage(biName)
+	backupTargetName := volume.Spec.BackupTargetName
+	if backupTargetName == "" {
+		backupTargetName = types.DefaultBackupTargetName
+	}
+	bbi, err := bc.ds.GetBackupBackingImagesWithBackupTargetNameRO(backupTargetName, biName)
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			return errors.Wrapf(err, "failed to get backup backing image %v", biName)
@@ -682,16 +737,23 @@ func (bc *BackupController) backupBackingImage(volume *longhorn.Volume) error {
 	}
 
 	if bbi == nil {
+		bbiName := types.GetBackupBackingImageNameFromBIName(biName)
 		backupBackingImage := &longhorn.BackupBackingImage{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: biName,
+				Name: bbiName,
+				Labels: map[string]string{
+					types.LonghornLabelBackupTarget: backupTargetName,
+					types.LonghornLabelBackingImage: biName,
+				},
 			},
 			Spec: longhorn.BackupBackingImageSpec{
-				UserCreated: true,
+				UserCreated:      true,
+				BackingImage:     biName,
+				BackupTargetName: backupTargetName,
 			},
 		}
 		if _, err = bc.ds.CreateBackupBackingImage(backupBackingImage); err != nil && !apierrors.IsAlreadyExists(err) {
-			return errors.Wrapf(err, "failed to create backup backing image %s in the cluster", biName)
+			return errors.Wrapf(err, "failed to create backup backing image %s for backing image %s of backup target %s in the cluster", bbiName, biName, backupTargetName)
 		}
 	}
 
@@ -733,6 +795,11 @@ func (bc *BackupController) checkMonitor(backup *longhorn.Backup, volume *longho
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil {
+			engineClientProxy.Close()
+		}
+	}()
 
 	// get storage class of the pvc binding with the volume
 	kubernetesStatus := &volume.Status.KubernetesStatus
@@ -762,34 +829,66 @@ func (bc *BackupController) checkMonitor(backup *longhorn.Backup, volume *longho
 	if engine.Status.CurrentState != longhorn.InstanceStateRunning ||
 		engine.Spec.DesireState != longhorn.InstanceStateRunning ||
 		volume.Status.State != longhorn.VolumeStateAttached {
+		bc.creationRetryCounter.IncreaseCount(backup.Name)
+		if bc.creationRetryCounter.GetCount(backup.Name) >= maxCreationRetry {
+			backup.Status.Error = fmt.Sprintf(FailedWaitingForEngineMessage, engine.Name)
+			backup.Status.State = longhorn.BackupStateError
+			backup.Status.LastSyncedAt = metav1.Time{Time: time.Now().UTC()}
+			bc.creationRetryCounter.DeleteEntry(backup.Name)
+			err = fmt.Errorf("failed waiting for the engine %v to be running before enabling backup monitor", engine.Name)
+			return nil, err
+		}
 		backup.Status.State = longhorn.BackupStatePending
 		backup.Status.Messages[MessageTypeReconcileInfo] = fmt.Sprintf(WaitForEngineMessage, engine.Name)
-		return nil, fmt.Errorf("waiting for the engine %v to be running before enabling backup monitor", engine.Name)
+		err = fmt.Errorf("waiting for the engine %v to be running before enabling backup monitor", engine.Name)
+		return nil, err
 	}
 
 	snapshot, err := bc.ds.GetSnapshotRO(backup.Spec.SnapshotName)
 	if err != nil {
-		backup.Status.State = longhorn.BackupStatePending
-		backup.Status.Messages[MessageTypeReconcileInfo] = fmt.Sprintf(FailedToGetSnapshotMessage, backup.Spec.SnapshotName)
-		return nil, errors.Wrapf(err, "failed to get the snapshot %v before enabling backup monitor", backup.Spec.SnapshotName)
+		bc.creationRetryCounter.IncreaseCount(backup.Name)
+		msg := fmt.Sprintf(FailedToGetSnapshotMessage, backup.Spec.SnapshotName)
+		if bc.creationRetryCounter.GetCount(backup.Name) >= maxCreationRetry {
+			backup.Status.Error = msg
+			backup.Status.State = longhorn.BackupStateError
+			backup.Status.LastSyncedAt = metav1.Time{Time: time.Now().UTC()}
+			bc.creationRetryCounter.DeleteEntry(backup.Name)
+		} else {
+			backup.Status.State = longhorn.BackupStatePending
+			backup.Status.Messages[MessageTypeReconcileInfo] = fmt.Sprintf(FailedToGetSnapshotMessage, backup.Spec.SnapshotName)
+		}
+		err = errors.Wrapf(err, "failed to get the snapshot %v before enabling backup monitor", backup.Spec.SnapshotName)
+		return nil, err
 	}
 	if snapshot != nil {
 		if !snapshot.Status.ReadyToUse {
+			bc.creationRetryCounter.IncreaseCount(backup.Name)
+			if bc.creationRetryCounter.GetCount(backup.Name) >= maxCreationRetry {
+				backup.Status.Error = fmt.Sprintf(FailedWaitingForSnapshotMessage, backup.Spec.SnapshotName)
+				backup.Status.State = longhorn.BackupStateError
+				backup.Status.LastSyncedAt = metav1.Time{Time: time.Now().UTC()}
+				bc.creationRetryCounter.DeleteEntry(backup.Name)
+				err = fmt.Errorf("failed waiting for the snapshot %v to be ready before enabling backup monitor", backup.Spec.SnapshotName)
+				return nil, err
+			}
 			backup.Status.State = longhorn.BackupStatePending
 			backup.Status.Messages[MessageTypeReconcileInfo] = fmt.Sprintf(WaitForSnapshotMessage, backup.Spec.SnapshotName)
-			return nil, fmt.Errorf("waiting for the snapshot %v to be ready before enabling backup monitor", backup.Spec.SnapshotName)
+			err = fmt.Errorf("waiting for the snapshot %v to be ready before enabling backup monitor", backup.Spec.SnapshotName)
+			return nil, err
 		}
 	}
 
-	clusterBackups, err := bc.ds.ListBackupsWithBackupVolumeName(volume.Name)
+	clusterBackups, err := bc.ds.ListBackupsWithBackupVolumeName(backupTarget.Name, volume.Name)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to list backups in the cluster")
+		err = errors.Wrapf(err, "failed to list backups in the cluster")
+		return nil, err
 	}
 	for _, b := range clusterBackups {
 		if b.Status.State == longhorn.BackupStateDeleting {
 			backup.Status.State = longhorn.BackupStatePending
 			backup.Status.Messages[MessageTypeReconcileInfo] = fmt.Sprintf(WaitForBackupDeletionIsCompleteMessage, b.Name)
-			return nil, fmt.Errorf("waiting for the backup %v to be deleted before enabling backup monitor", b.Name)
+			err = fmt.Errorf("waiting for the backup %v to be deleted before enabling backup monitor", b.Name)
+			return nil, err
 		}
 	}
 
@@ -802,6 +901,9 @@ func (bc *BackupController) checkMonitor(backup *longhorn.Backup, volume *longho
 		backup.Status.LastSyncedAt = metav1.Time{Time: time.Now().UTC()}
 		return nil, err
 	}
+
+	// backup creation is succeeded, remove it from the counter
+	bc.creationRetryCounter.DeleteEntry(backup.Name)
 	return monitor, nil
 }
 
@@ -838,9 +940,9 @@ func (bc *BackupController) syncWithMonitor(backup *longhorn.Backup, volume *lon
 
 // syncBackupVolume triggers the backup_volume_controller/backup_target_controller
 // to run reconcile immediately
-func (bc *BackupController) syncBackupVolume(volumeName string) error {
+func (bc *BackupController) syncBackupVolume(backupTargetName, volumeName string) error {
 	syncTime := metav1.Time{Time: time.Now().UTC()}
-	backupVolume, err := bc.ds.GetBackupVolume(volumeName)
+	backupVolume, err := bc.ds.GetBackupVolumeByBackupTargetAndVolume(backupTargetName, volumeName)
 	if err == nil {
 		// Request backup_volume_controller to reconcile BackupVolume immediately.
 		backupVolume.Spec.SyncRequestedAt = syncTime
@@ -849,7 +951,7 @@ func (bc *BackupController) syncBackupVolume(volumeName string) error {
 		}
 	} else if err != nil && apierrors.IsNotFound(err) {
 		// Request backup_target_controller to reconcile BackupTarget immediately.
-		backupTarget, err := bc.ds.GetBackupTarget(types.DefaultBackupTargetName)
+		backupTarget, err := bc.ds.GetBackupTarget(backupTargetName)
 		if err != nil {
 			return errors.Wrap(err, "failed to get backup target")
 		}

@@ -5,9 +5,10 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
-
 	"github.com/rancher/go-rancher/api"
 	"github.com/rancher/go-rancher/client"
+
+	"github.com/longhorn/longhorn-manager/types"
 )
 
 func (s *Server) backupBackingImageList(apiContext *api.ApiContext) (*client.GenericCollection, error) {
@@ -56,15 +57,23 @@ func (s *Server) BackupBackingImageRestore(w http.ResponseWriter, req *http.Requ
 	}
 
 	backupBackingImageName := mux.Vars(req)["name"]
-	if err := s.m.RestoreBackupBackingImage(backupBackingImageName, input.Secret, input.SecretNamespace); err != nil {
+	if err := s.m.RestoreBackupBackingImage(backupBackingImageName, input.Secret, input.SecretNamespace, input.DataEngine); err != nil {
 		return errors.Wrapf(err, "failed to restore backup backing image '%s'", backupBackingImageName)
 	}
 	return nil
 }
 
 func (s *Server) BackupBackingImageCreate(w http.ResponseWriter, req *http.Request) error {
-	backupBackingImageName := mux.Vars(req)["name"]
-	if err := s.m.CreateBackupBackingImage(backupBackingImageName); err != nil {
+	var input BackupBackingImage
+
+	apiContext := api.GetApiContext(req)
+	if err := apiContext.Read(&input); err != nil {
+		return err
+	}
+
+	backingImageName := mux.Vars(req)["name"]
+	backupBackingImageName := types.GetBackupBackingImageNameFromBIName(backingImageName)
+	if err := s.m.CreateBackupBackingImage(backupBackingImageName, backingImageName, input.BackupTargetName); err != nil {
 		return errors.Wrapf(err, "failed to create backup backing image '%s'", backupBackingImageName)
 	}
 	return nil

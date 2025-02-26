@@ -3,23 +3,124 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/rancher/go-rancher/api"
 	"github.com/rancher/go-rancher/client"
+
+	"github.com/longhorn/longhorn-manager/util"
+
+	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 )
+
+func (s *Server) BackupTargetGet(w http.ResponseWriter, req *http.Request) error {
+	apiContext := api.GetApiContext(req)
+
+	backupTargetName := mux.Vars(req)["backupTargetName"]
+	backupTarget, err := s.m.GetBackupTarget(backupTargetName)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get backup target %v", backupTargetName)
+	}
+	apiContext.Write(toBackupTargetResource(backupTarget, apiContext))
+	return nil
+}
 
 func (s *Server) BackupTargetList(w http.ResponseWriter, req *http.Request) error {
 	apiContext := api.GetApiContext(req)
 
-	backupTargets, err := s.m.ListBackupTargetsSorted()
+	bts, err := s.backupTargetList(apiContext)
 	if err != nil {
-		return errors.Wrap(err, "failed to list backup targets")
+		return err
 	}
-	apiContext.Write(toBackupTargetCollection(backupTargets, apiContext))
+
+	apiContext.Write(bts)
+	return nil
+}
+
+func (s *Server) backupTargetList(apiContext *api.ApiContext) (*client.GenericCollection, error) {
+	bts, err := s.m.ListBackupTargetsSorted()
+	if err != nil {
+		return nil, err
+	}
+	return toBackupTargetCollection(bts, apiContext), nil
+}
+
+func (s *Server) BackupTargetCreate(rw http.ResponseWriter, req *http.Request) error {
+	var input BackupTarget
+	apiContext := api.GetApiContext(req)
+
+	if err := apiContext.Read(&input); err != nil {
+		return err
+	}
+
+	backupTargetSpec, err := newBackupTarget(input)
+	if err != nil {
+		return err
+	}
+
+	obj, err := s.m.CreateBackupTarget(input.Name, backupTargetSpec)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create backup target %v", input.Name)
+	}
+	apiContext.Write(toBackupTargetResource(obj, apiContext))
+	return nil
+}
+
+func newBackupTarget(input BackupTarget) (*longhorn.BackupTargetSpec, error) {
+	pollInterval, err := strconv.ParseInt(input.PollInterval, 10, 64)
+	if err != nil {
+		return nil, errors.Wrapf(err, "invalid backup target polling interval '%s'", input.PollInterval)
+	}
+
+	return &longhorn.BackupTargetSpec{
+		BackupTargetURL:  input.BackupTargetURL,
+		CredentialSecret: input.CredentialSecret,
+		PollInterval:     metav1.Duration{Duration: time.Duration(pollInterval) * time.Second}}, nil
+}
+
+func (s *Server) BackupTargetUpdate(rw http.ResponseWriter, req *http.Request) error {
+	var input BackupTarget
+
+	apiContext := api.GetApiContext(req)
+	if err := apiContext.Read(&input); err != nil {
+		return err
+	}
+
+	name := input.Name
+	backupTargetSpec, err := newBackupTarget(input)
+	if err != nil {
+		return err
+	}
+
+	obj, err := util.RetryOnConflictCause(func() (interface{}, error) {
+		return s.m.UpdateBackupTarget(name, backupTargetSpec)
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to update backup target %v", name)
+	}
+
+	backupTarget, ok := obj.(*longhorn.BackupTarget)
+	if !ok {
+		return fmt.Errorf("failed to convert %v to backup target", name)
+	}
+
+	apiContext.Write(toBackupTargetResource(backupTarget, apiContext))
+	return nil
+}
+
+func (s *Server) BackupTargetDelete(rw http.ResponseWriter, req *http.Request) error {
+	backupTargetName := mux.Vars(req)["backupTargetName"]
+	if err := s.m.DeleteBackupTarget(backupTargetName); err != nil {
+		return errors.Wrapf(err, "failed to delete backup target %v", backupTargetName)
+	}
+
 	return nil
 }
 
@@ -99,11 +200,11 @@ func (s *Server) backupVolumeList(apiContext *api.ApiContext) (*client.GenericCo
 func (s *Server) BackupVolumeGet(w http.ResponseWriter, req *http.Request) error {
 	apiContext := api.GetApiContext(req)
 
-	volName := mux.Vars(req)["volName"]
+	backupVolumeName := mux.Vars(req)["backupVolumeName"]
 
-	bv, err := s.m.GetBackupVolume(volName)
+	bv, err := s.m.GetBackupVolume(backupVolumeName)
 	if err != nil {
-		return errors.Wrapf(err, "failed to get backup volume '%s'", volName)
+		return errors.Wrapf(err, "failed to get backup volume '%s'", backupVolumeName)
 	}
 	apiContext.Write(toBackupVolumeResource(bv, apiContext))
 	return nil
@@ -142,20 +243,20 @@ func (s *Server) SyncBackupVolume(w http.ResponseWriter, req *http.Request) erro
 		return err
 	}
 
-	volName := mux.Vars(req)["volName"]
-	if volName == "" {
+	backupVolumeName := mux.Vars(req)["backupVolumeName"]
+	if backupVolumeName == "" {
 		return fmt.Errorf("backup volume name is required")
 	}
 
-	bv, err := s.m.GetBackupVolume(volName)
+	bv, err := s.m.GetBackupVolume(backupVolumeName)
 	if err != nil {
-		return errors.Wrapf(err, "failed to get backup volume '%s'", volName)
+		return errors.Wrapf(err, "failed to get backup volume '%s'", backupVolumeName)
 	}
 
 	if input.SyncBackupVolume {
 		bv, err = s.m.SyncBackupVolume(bv)
 		if err != nil {
-			return errors.Wrapf(err, "failed to synchronize backup volume %v", volName)
+			return errors.Wrapf(err, "failed to synchronize backup volume %v", backupVolumeName)
 		}
 	}
 
@@ -164,9 +265,9 @@ func (s *Server) SyncBackupVolume(w http.ResponseWriter, req *http.Request) erro
 }
 
 func (s *Server) BackupVolumeDelete(w http.ResponseWriter, req *http.Request) error {
-	volName := mux.Vars(req)["volName"]
-	if err := s.m.DeleteBackupVolume(volName); err != nil {
-		return errors.Wrapf(err, "failed to delete backup volume '%s'", volName)
+	backupVolumeName := mux.Vars(req)["backupVolumeName"]
+	if err := s.m.DeleteBackupVolume(backupVolumeName); err != nil {
+		return errors.Wrapf(err, "failed to delete backup volume '%s'", backupVolumeName)
 	}
 	return nil
 }
@@ -174,11 +275,22 @@ func (s *Server) BackupVolumeDelete(w http.ResponseWriter, req *http.Request) er
 func (s *Server) BackupList(w http.ResponseWriter, req *http.Request) error {
 	apiContext := api.GetApiContext(req)
 
-	volName := mux.Vars(req)["volName"]
-
-	bs, err := s.m.ListBackupsForVolumeSorted(volName)
+	bs, err := s.m.ListAllBackupsSorted()
 	if err != nil {
-		return errors.Wrapf(err, "failed to list backups for volume '%s'", volName)
+		return errors.Wrapf(err, "failed to list all backups")
+	}
+	apiContext.Write(toBackupCollection(bs))
+	return nil
+}
+
+func (s *Server) BackupListByBackupVolume(w http.ResponseWriter, req *http.Request) error {
+	apiContext := api.GetApiContext(req)
+
+	backupVolumeName := mux.Vars(req)["backupVolumeName"]
+
+	bs, err := s.m.ListBackupsForBackupVolumeSorted(backupVolumeName)
+	if err != nil {
+		return errors.Wrapf(err, "failed to list backups for volume '%s'", backupVolumeName)
 	}
 	apiContext.Write(toBackupCollection(bs))
 	return nil
@@ -203,14 +315,14 @@ func (s *Server) BackupGet(w http.ResponseWriter, req *http.Request) error {
 	if input.Name == "" {
 		return errors.New("empty backup name is not allowed")
 	}
-	volName := mux.Vars(req)["volName"]
+	backupVolumeName := mux.Vars(req)["backupVolumeName"]
 
-	backup, err := s.m.GetBackup(input.Name, volName)
+	backup, err := s.m.GetBackup(input.Name)
 	if err != nil {
-		return errors.Wrapf(err, "failed to get backup '%v' of volume '%v'", input.Name, volName)
+		return errors.Wrapf(err, "failed to get backup '%v' of volume '%v'", input.Name, backupVolumeName)
 	}
 	if backup == nil {
-		logrus.Warnf("cannot find backup '%v' of volume '%v'", input.Name, volName)
+		logrus.Warnf("cannot find backup '%v' of volume '%v'", input.Name, backupVolumeName)
 		w.WriteHeader(http.StatusNotFound)
 		return nil
 	}
@@ -230,22 +342,22 @@ func (s *Server) BackupDelete(w http.ResponseWriter, req *http.Request) error {
 		return errors.New("empty backup name is not allowed")
 	}
 
-	volName := mux.Vars(req)["volName"]
+	backupVolumeName := mux.Vars(req)["backupVolumeName"]
 
-	backup, err := s.m.GetBackup(input.Name, volName)
+	backup, err := s.m.GetBackup(input.Name)
 	if err != nil {
-		logrus.WithError(err).Warnf("failed to get backup '%v' of volume '%v'", input.Name, volName)
+		logrus.WithError(err).Warnf("failed to get backup '%v' of volume '%v'", input.Name, backupVolumeName)
 	}
 
 	if backup != nil {
-		if err := s.m.DeleteBackup(input.Name, volName); err != nil {
-			return errors.Wrapf(err, "failed to delete backup '%v' of volume '%v'", input.Name, volName)
+		if err := s.m.DeleteBackup(input.Name); err != nil {
+			return errors.Wrapf(err, "failed to delete backup '%v' of volume '%v'", input.Name, backupVolumeName)
 		}
 	}
 
-	bv, err := s.m.GetBackupVolume(volName)
+	bv, err := s.m.GetBackupVolume(backupVolumeName)
 	if err != nil {
-		return errors.Wrapf(err, "failed to get backup volume '%s'", volName)
+		return errors.Wrapf(err, "failed to get backup volume '%s'", backupVolumeName)
 	}
 	apiContext.Write(toBackupVolumeResource(bv, apiContext))
 	return nil

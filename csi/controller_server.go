@@ -126,14 +126,25 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 					if id == "" {
 						return nil, status.Errorf(codes.NotFound, "volume source snapshot %v is not found", snapshot.SnapshotId)
 					}
-					backupVolume, backupName := sourceVolumeName, id
-					bv, err := cs.apiClient.BackupVolume.ById(backupVolume)
+					backupName := id
+					bvs, err := cs.getBackupVolumes(sourceVolumeName)
 					if err != nil {
-						return nil, status.Errorf(codes.NotFound, "failed to restore CSI snapshot %s backup volume %s unavailable", snapshot.SnapshotId, backupVolume)
+						return nil, status.Errorf(codes.Internal, "failed to retrieve backup volumes of volume %v: %v", sourceVolumeName, err)
 					}
-
-					backup, err := cs.apiClient.BackupVolume.ActionBackupGet(bv, &longhornclient.BackupInput{Name: backupName})
-					if err != nil {
+					if len(bvs) == 0 {
+						return nil, status.Errorf(codes.NotFound, "failed to restore CSI snapshot %v of volume %v: there is no backup volume", snapshot.SnapshotId, sourceVolumeName)
+					}
+					var backup *longhornclient.Backup
+					for _, bv := range bvs {
+						backup, err = cs.apiClient.BackupVolume.ActionBackupGet(bv, &longhornclient.BackupInput{Name: backupName})
+						if err != nil {
+							return nil, status.Errorf(codes.NotFound, "failed to restore CSI snapshot %v : failed to get backup %v: %v", snapshot.SnapshotId, backupName, err)
+						}
+						if backup != nil {
+							break
+						}
+					}
+					if backup == nil {
 						return nil, status.Errorf(codes.NotFound, "failed to restore CSI snapshot %v backup %s unavailable", snapshot.SnapshotId, backupName)
 					}
 
@@ -227,7 +238,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	if err = cs.checkAndPrepareBackingImage(volumeID, vol.BackingImage, volumeParameters); err != nil {
+	if err = cs.checkAndPrepareBackingImage(volumeID, vol.BackingImage, volumeParameters, vol.DataEngine); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
@@ -265,7 +276,25 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}, nil
 }
 
-func (cs *ControllerServer) checkAndPrepareBackingImage(volumeName, backingImageName string, volumeParameters map[string]string) error {
+func (cs *ControllerServer) getBackupVolumes(volumeName string) ([]*longhornclient.BackupVolume, error) {
+	bvs := []*longhornclient.BackupVolume{}
+	log := cs.log.WithFields(logrus.Fields{"function": "getBackupVolume"})
+	list, err := cs.apiClient.BackupVolume.List(&longhornclient.ListOpts{})
+	if err != nil {
+		return nil, err
+	}
+	for _, bv := range list.Data {
+		if bv.VolumeName == volumeName {
+			bvs = append(bvs, &bv)
+		}
+	}
+	if len(bvs) == 0 {
+		log.Debugf("cannot find backup volume for volume %s", volumeName)
+	}
+	return bvs, nil
+}
+
+func (cs *ControllerServer) checkAndPrepareBackingImage(volumeName, backingImageName string, volumeParameters map[string]string, dataEngine string) error {
 	if backingImageName == "" {
 		return nil
 	}
@@ -309,6 +338,7 @@ func (cs *ControllerServer) checkAndPrepareBackingImage(volumeName, backingImage
 			ExpectedChecksum: biChecksum,
 			SourceType:       bidsType,
 			Parameters:       bidsParameters,
+			DataEngine:       dataEngine,
 		}
 
 		if minNumberOfCopies, ok := volumeParameters[longhorn.BackingImageParameterMinNumberOfCopies]; ok {
@@ -573,12 +603,8 @@ func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 
 	return cs.unpublishVolume(volume, nodeID, attachmentID, func() error {
 		checkVolumeUnpublished := func(vol *longhornclient.Volume) bool {
-			isRegularRWXVolume := vol.AccessMode == string(longhorn.AccessModeReadWriteMany) && !vol.Migratable
 			_, ok := vol.VolumeAttachment.Attachments[attachmentID]
-			if isRegularRWXVolume {
-				return !ok
-			}
-			return !ok && !isVolumeAvailableOn(vol, nodeID)
+			return !ok
 		}
 
 		if !cs.waitForVolumeState(volumeID, "volume unpublished", checkVolumeUnpublished, false, true) {
@@ -1003,7 +1029,7 @@ func (cs *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 		if id == "" {
 			return nil, status.Errorf(codes.NotFound, "volume source snapshot %v is not found", snapshotID)
 		}
-		if err := cs.cleanupBackupVolume(sourceVolumeName, id); err != nil {
+		if err := cs.cleanupBackup(sourceVolumeName, id); err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}
@@ -1040,19 +1066,27 @@ func (cs *ControllerServer) cleanupSnapshot(sourceVolumeName, id string) error {
 	return nil
 }
 
-func (cs *ControllerServer) cleanupBackupVolume(sourceVolumeName, id string) error {
+func (cs *ControllerServer) cleanupBackup(sourceVolumeName, id string) error {
 	backupVolumeName, backupName := sourceVolumeName, id
-	backupVolume, err := cs.apiClient.BackupVolume.ById(backupVolumeName)
+	backupVolumes, err := cs.getBackupVolumes(backupVolumeName)
 	if err != nil {
 		return err
 	}
-	if backupVolume != nil && backupVolume.Name != "" {
-		if _, err = cs.apiClient.BackupVolume.ActionBackupDelete(backupVolume, &longhornclient.BackupInput{
-			Name: backupName,
-		}); err != nil {
-			return err
+	for _, bv := range backupVolumes {
+		// The BackupDelete API actually doesn't care about bv when deleting a backup.
+		// The bv is there for backward compatibility.
+		// Any bv will work
+		if bv.Name != "" {
+			_, err = cs.apiClient.BackupVolume.ActionBackupDelete(bv, &longhornclient.BackupInput{
+				Name: backupName,
+			})
+			if err != nil {
+				return err
+			}
+			return nil
 		}
 	}
+
 	return nil
 }
 
@@ -1220,7 +1254,7 @@ func (cs *ControllerServer) waitForBackupControllerSync(volumeName, snapshotName
 	if err != nil {
 		return nil, err
 	}
-	if backup.SnapshotCreated != "" {
+	if backup != nil && backup.SnapshotCreated != "" {
 		// The backup controller sets the snapshot creation time at first sync. If we do not wait to return until
 		// this is done, we may see timestamp related errors in csi-snapshotter logs.
 		return backup, nil
@@ -1245,7 +1279,7 @@ func (cs *ControllerServer) waitForBackupControllerSync(volumeName, snapshotName
 			if err != nil {
 				return nil, err
 			}
-			if backup.SnapshotCreated != "" {
+			if backup != nil && backup.SnapshotCreated != "" {
 				return backup, nil
 			}
 		}
@@ -1256,26 +1290,28 @@ func (cs *ControllerServer) waitForBackupControllerSync(volumeName, snapshotName
 // snapshot. It does not rely on volume.BackupStatus because volume.BackupStatus.Snapshot is only set if the backup
 // successfully initializes and after the backup monitor has had a chance to sync. We want to retrieve the backup
 // (and in particular, its name) as quickly as possible and in any state.
+// Note: if the backup doesn't exist it will return nil for the backup and nil for the error
 func (cs *ControllerServer) getBackup(volumeName, snapshotName string) (*longhornclient.Backup, error) {
-	// Successfully returns an empty BackupVolume with volumeName even if one doesn't exist.
-	backupVolume, err := cs.apiClient.BackupVolume.ById(volumeName)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	backupListOutput, err := cs.apiClient.BackupVolume.ActionBackupList(backupVolume)
+	backupVolumes, err := cs.getBackupVolumes(volumeName)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	var backup *longhornclient.Backup
-	for _, b := range backupListOutput.Data {
-		if b.SnapshotName == snapshotName {
-			backup = &b
-			break
+	for _, bv := range backupVolumes {
+		backupListOutput, err := cs.apiClient.BackupVolume.ActionBackupList(bv)
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		for _, b := range backupListOutput.Data {
+			if b.SnapshotName == snapshotName {
+				backup = &b
+				return backup, nil
+			}
 		}
 	}
 
-	return backup, nil
+	return nil, nil
 }
 
 func (cs *ControllerServer) validateVolumeCapabilities(volumeCaps []*csi.VolumeCapability) error {

@@ -532,6 +532,46 @@ func ListAndUpdateEnginesInProvidedCache(namespace string, lhClient *lhclientset
 	return engines, nil
 }
 
+// ListAndUpdateBackupTargetsInProvidedCache list all backup targets and save them into the provided cached `resourceMap`. This method is not thread-safe.
+func ListAndUpdateBackupTargetsInProvidedCache(namespace string, lhClient *lhclientset.Clientset, resourceMaps map[string]interface{}) (map[string]*longhorn.BackupTarget, error) {
+	if v, ok := resourceMaps[types.LonghornKindBackupTarget]; ok {
+		return v.(map[string]*longhorn.BackupTarget), nil
+	}
+
+	backupTargets := map[string]*longhorn.BackupTarget{}
+	backupTargetList, err := lhClient.LonghornV1beta2().BackupTargets(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for i, backupTarget := range backupTargetList.Items {
+		backupTargets[backupTarget.Name] = &backupTargetList.Items[i]
+	}
+
+	resourceMaps[types.LonghornKindBackupTarget] = backupTargets
+
+	return backupTargets, nil
+}
+
+// ListAndUpdateBackupVolumesInProvidedCache list all backup volumes and save them into the provided cached `resourceMap`. This method is not thread-safe.
+func ListAndUpdateBackupVolumesInProvidedCache(namespace string, lhClient *lhclientset.Clientset, resourceMaps map[string]interface{}) (map[string]*longhorn.BackupVolume, error) {
+	if v, ok := resourceMaps[types.LonghornKindBackupVolume]; ok {
+		return v.(map[string]*longhorn.BackupVolume), nil
+	}
+
+	backupVolumes := map[string]*longhorn.BackupVolume{}
+	backupVolumeList, err := lhClient.LonghornV1beta2().BackupVolumes(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for i, backupVolume := range backupVolumeList.Items {
+		backupVolumes[backupVolume.Name] = &backupVolumeList.Items[i]
+	}
+
+	resourceMaps[types.LonghornKindBackupVolume] = backupVolumes
+
+	return backupVolumes, nil
+}
+
 // ListAndUpdateBackupsInProvidedCache list all backups and save them into the provided cached `resourceMap`. This method is not thread-safe.
 func ListAndUpdateBackupsInProvidedCache(namespace string, lhClient *lhclientset.Clientset, resourceMaps map[string]interface{}) (map[string]*longhorn.Backup, error) {
 	if v, ok := resourceMaps[types.LonghornKindBackup]; ok {
@@ -550,6 +590,26 @@ func ListAndUpdateBackupsInProvidedCache(namespace string, lhClient *lhclientset
 	resourceMaps[types.LonghornKindBackup] = backups
 
 	return backups, nil
+}
+
+// ListAndUpdateBackupBackingImagesInProvidedCache list all backupBackingImages and save them into the provided cached `resourceMap`. This method is not thread-safe.
+func ListAndUpdateBackupBackingImagesInProvidedCache(namespace string, lhClient *lhclientset.Clientset, resourceMaps map[string]interface{}) (map[string]*longhorn.BackupBackingImage, error) {
+	if v, ok := resourceMaps[types.LonghornKindBackupBackingImage]; ok {
+		return v.(map[string]*longhorn.BackupBackingImage), nil
+	}
+
+	bbis := map[string]*longhorn.BackupBackingImage{}
+	bbisList, err := lhClient.LonghornV1beta2().BackupBackingImages(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for i, bbi := range bbisList.Items {
+		bbis[bbi.Name] = &bbisList.Items[i]
+	}
+
+	resourceMaps[types.LonghornKindBackupBackingImage] = bbis
+
+	return bbis, nil
 }
 
 // ListAndUpdateSnapshotsInProvidedCache list all snapshots and save them into the provided cached `resourceMap`. This method is not thread-safe.
@@ -692,6 +752,26 @@ func ListAndUpdateVolumeAttachmentsInProvidedCache(namespace string, lhClient *l
 	return volumeAttachments, nil
 }
 
+// ListAndUpdateSystemBackupsInProvidedCache list all system backups and save them into the provided cached `resourceMap`. This method is not thread-safe.
+func ListAndUpdateSystemBackupsInProvidedCache(namespace string, lhClient *lhclientset.Clientset, resourceMaps map[string]interface{}) (map[string]*longhorn.SystemBackup, error) {
+	if v, ok := resourceMaps[types.LonghornKindSystemBackup]; ok {
+		return v.(map[string]*longhorn.SystemBackup), nil
+	}
+
+	systemBackups := map[string]*longhorn.SystemBackup{}
+	systemBackupList, err := lhClient.LonghornV1beta2().SystemBackups(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for i, sb := range systemBackupList.Items {
+		systemBackups[sb.Name] = &systemBackupList.Items[i]
+	}
+
+	resourceMaps[types.LonghornKindSystemBackup] = systemBackups
+
+	return systemBackups, nil
+}
+
 // CreateAndUpdateRecurringJobInProvidedCache creates a recurringJob and saves it into the provided cached `resourceMap`. This method is not thread-safe.
 func CreateAndUpdateRecurringJobInProvidedCache(namespace string, lhClient *lhclientset.Clientset, resourceMaps map[string]interface{}, job *longhorn.RecurringJob) (*longhorn.RecurringJob, error) {
 	obj, err := lhClient.LonghornV1beta2().RecurringJobs(namespace).Create(context.TODO(), job, metav1.CreateOptions{})
@@ -746,8 +826,16 @@ func UpdateResources(namespace string, lhClient *lhclientset.Clientset, resource
 			err = updateEngines(namespace, lhClient, resourceMap.(map[string]*longhorn.Engine))
 		case types.LonghornKindReplica:
 			err = updateReplicas(namespace, lhClient, resourceMap.(map[string]*longhorn.Replica))
+		case types.LonghornKindBackupTarget:
+			err = updateBackupTargets(namespace, lhClient, resourceMap.(map[string]*longhorn.BackupTarget))
+		case types.LonghornKindBackupVolume:
+			err = updateBackupVolumes(namespace, lhClient, resourceMap.(map[string]*longhorn.BackupVolume))
 		case types.LonghornKindBackup:
 			err = updateBackups(namespace, lhClient, resourceMap.(map[string]*longhorn.Backup))
+		case types.LonghornKindBackupBackingImage:
+			err = updateBackupBackingImages(namespace, lhClient, resourceMap.(map[string]*longhorn.BackupBackingImage))
+		case types.LonghornKindBackingImageDataSource:
+			err = updateBackingImageDataSources(namespace, lhClient, resourceMap.(map[string]*longhorn.BackingImageDataSource))
 		case types.LonghornKindEngineImage:
 			err = updateEngineImages(namespace, lhClient, resourceMap.(map[string]*longhorn.EngineImage))
 		case types.LonghornKindInstanceManager:
@@ -766,6 +854,8 @@ func UpdateResources(namespace string, lhClient *lhclientset.Clientset, resource
 			err = updateSnapshots(namespace, lhClient, resourceMap.(map[string]*longhorn.Snapshot))
 		case types.LonghornKindOrphan:
 			err = updateOrphans(namespace, lhClient, resourceMap.(map[string]*longhorn.Orphan))
+		case types.LonghornKindSystemBackup:
+			err = updateSystemBackups(namespace, lhClient, resourceMap.(map[string]*longhorn.SystemBackup))
 		default:
 			return fmt.Errorf("resource kind %v is not able to updated", resourceKind)
 		}
@@ -858,6 +948,46 @@ func updateEngines(namespace string, lhClient *lhclientset.Clientset, engines ma
 	return nil
 }
 
+func updateBackupTargets(namespace string, lhClient *lhclientset.Clientset, backupTargets map[string]*longhorn.BackupTarget) error {
+	existingBackupTargetList, err := lhClient.LonghornV1beta2().BackupTargets(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, existingBackupTarget := range existingBackupTargetList.Items {
+		backupTarget, ok := backupTargets[existingBackupTarget.Name]
+		if !ok {
+			continue
+		}
+		if !reflect.DeepEqual(existingBackupTarget.Spec, backupTarget.Spec) ||
+			!reflect.DeepEqual(existingBackupTarget.ObjectMeta, backupTarget.ObjectMeta) {
+			if _, err = lhClient.LonghornV1beta2().BackupTargets(namespace).Update(context.TODO(), backupTarget, metav1.UpdateOptions{}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func updateBackupVolumes(namespace string, lhClient *lhclientset.Clientset, backupVolumes map[string]*longhorn.BackupVolume) error {
+	existingBackupVolumeList, err := lhClient.LonghornV1beta2().BackupVolumes(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, existingBackupVolume := range existingBackupVolumeList.Items {
+		backupVolume, ok := backupVolumes[existingBackupVolume.Name]
+		if !ok {
+			continue
+		}
+		if !reflect.DeepEqual(existingBackupVolume.Spec, backupVolume.Spec) ||
+			!reflect.DeepEqual(existingBackupVolume.ObjectMeta, backupVolume.ObjectMeta) {
+			if _, err = lhClient.LonghornV1beta2().BackupVolumes(namespace).Update(context.TODO(), backupVolume, metav1.UpdateOptions{}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func updateBackups(namespace string, lhClient *lhclientset.Clientset, backups map[string]*longhorn.Backup) error {
 	existingBackupList, err := lhClient.LonghornV1beta2().Backups(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
@@ -872,6 +1002,46 @@ func updateBackups(namespace string, lhClient *lhclientset.Clientset, backups ma
 		if !reflect.DeepEqual(existingBackup.Spec, backup.Spec) ||
 			!reflect.DeepEqual(existingBackup.ObjectMeta, backup.ObjectMeta) {
 			if _, err = lhClient.LonghornV1beta2().Backups(namespace).Update(context.TODO(), backup, metav1.UpdateOptions{}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func updateBackupBackingImages(namespace string, lhClient *lhclientset.Clientset, backupBackingImages map[string]*longhorn.BackupBackingImage) error {
+	existingBackupBackingImageList, err := lhClient.LonghornV1beta2().BackupBackingImages(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, existingBackupBackingImage := range existingBackupBackingImageList.Items {
+		backupBackingImage, ok := backupBackingImages[existingBackupBackingImage.Name]
+		if !ok {
+			continue
+		}
+		if !reflect.DeepEqual(existingBackupBackingImage.Spec, backupBackingImage.Spec) ||
+			!reflect.DeepEqual(existingBackupBackingImage.ObjectMeta, backupBackingImage.ObjectMeta) {
+			if _, err = lhClient.LonghornV1beta2().BackupBackingImages(namespace).Update(context.TODO(), backupBackingImage, metav1.UpdateOptions{}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func updateBackingImageDataSources(namespace string, lhClient *lhclientset.Clientset, backingImageDataSources map[string]*longhorn.BackingImageDataSource) error {
+	existingBackingImageDataSourceList, err := lhClient.LonghornV1beta2().BackingImageDataSources(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, existingBackingImageDataSource := range existingBackingImageDataSourceList.Items {
+		backingImageDataSource, ok := backingImageDataSources[existingBackingImageDataSource.Name]
+		if !ok {
+			continue
+		}
+		if !reflect.DeepEqual(existingBackingImageDataSource.Spec, backingImageDataSource.Spec) ||
+			!reflect.DeepEqual(existingBackingImageDataSource.ObjectMeta, backingImageDataSource.ObjectMeta) {
+			if _, err = lhClient.LonghornV1beta2().BackingImageDataSources(namespace).Update(context.TODO(), backingImageDataSource, metav1.UpdateOptions{}); err != nil {
 				return err
 			}
 		}
@@ -1050,6 +1220,26 @@ func updateOrphans(namespace string, lhClient *lhclientset.Clientset, orphans ma
 	return nil
 }
 
+func updateSystemBackups(namespace string, lhClient *lhclientset.Clientset, systemBackups map[string]*longhorn.SystemBackup) error {
+	existingSystemBackupList, err := lhClient.LonghornV1beta2().SystemBackups(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, existingSystemBackup := range existingSystemBackupList.Items {
+		sb, ok := systemBackups[existingSystemBackup.Name]
+		if !ok {
+			continue
+		}
+		if !reflect.DeepEqual(existingSystemBackup.Spec, sb.Spec) ||
+			!reflect.DeepEqual(existingSystemBackup.ObjectMeta, sb.ObjectMeta) {
+			if _, err = lhClient.LonghornV1beta2().SystemBackups(namespace).Update(context.TODO(), sb, metav1.UpdateOptions{}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func createOrUpdateVolumeAttachments(namespace string, lhClient *lhclientset.Clientset, volumeAttachments map[string]*longhorn.VolumeAttachment) error {
 	existingVolumeAttachmentList, err := lhClient.LonghornV1beta2().VolumeAttachments(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
@@ -1092,6 +1282,10 @@ func UpdateResourcesStatus(namespace string, lhClient *lhclientset.Clientset, re
 			err = updateEngineStatus(namespace, lhClient, resourceMap.(map[string]*longhorn.Engine))
 		case types.LonghornKindSetting:
 			err = updateSettingStatus(namespace, lhClient, resourceMap.(map[string]*longhorn.Setting))
+		case types.LonghornKindBackup:
+			err = updateBackupStatus(namespace, lhClient, resourceMap.(map[string]*longhorn.Backup))
+		case types.LonghornKindBackingImage:
+			err = updateBackingImageStatus(namespace, lhClient, resourceMap.(map[string]*longhorn.BackingImage))
 		default:
 			return fmt.Errorf("resource kind %v is not able to updated", resourceKind)
 		}
@@ -1171,6 +1365,42 @@ func updateSettingStatus(namespace string, lhClient *lhclientset.Clientset, sett
 		}
 
 		if _, err = lhClient.LonghornV1beta2().Settings(namespace).UpdateStatus(context.TODO(), setting, metav1.UpdateOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func updateBackupStatus(namespace string, lhClient *lhclientset.Clientset, backups map[string]*longhorn.Backup) error {
+	existingBackupList, err := lhClient.LonghornV1beta2().Backups(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, existingBackup := range existingBackupList.Items {
+		backup, ok := backups[existingBackup.Name]
+		if !ok {
+			continue
+		}
+
+		if _, err = lhClient.LonghornV1beta2().Backups(namespace).UpdateStatus(context.TODO(), backup, metav1.UpdateOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func updateBackingImageStatus(namespace string, lhClient *lhclientset.Clientset, backingImages map[string]*longhorn.BackingImage) error {
+	existingBackingImageList, err := lhClient.LonghornV1beta2().BackingImages(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, existingBackingImage := range existingBackingImageList.Items {
+		bi, ok := backingImages[existingBackingImage.Name]
+		if !ok {
+			continue
+		}
+
+		if _, err = lhClient.LonghornV1beta2().BackingImages(namespace).UpdateStatus(context.TODO(), bi, metav1.UpdateOptions{}); err != nil {
 			return err
 		}
 	}

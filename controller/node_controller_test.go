@@ -9,16 +9,17 @@ import (
 	"github.com/sirupsen/logrus"
 	. "gopkg.in/check.v1"
 
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/kubernetes/pkg/controller"
+
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	fake "k8s.io/client-go/kubernetes/fake"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/record"
-	"k8s.io/kubernetes/pkg/controller"
 
 	"github.com/longhorn/longhorn-manager/datastore"
 	"github.com/longhorn/longhorn-manager/types"
@@ -187,10 +188,6 @@ func (s *NodeControllerSuite) TestManagerPodUp(c *C) {
 					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
 				},
 			},
 			TestNode2: {
@@ -210,6 +207,8 @@ func (s *NodeControllerSuite) TestManagerPodUp(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -275,10 +274,6 @@ func (s *NodeControllerSuite) TestManagerPodDown(c *C) {
 					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonManagerPodDown),
 					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonNoMountPropagationSupport),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
 				},
 			},
 			TestNode2: {
@@ -298,6 +293,8 @@ func (s *NodeControllerSuite) TestManagerPodDown(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -363,10 +360,6 @@ func (s *NodeControllerSuite) TestKubeNodeDown(c *C) {
 					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonKubernetesNodeNotReady),
 					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
 				},
 			},
 			TestNode2: {
@@ -386,6 +379,8 @@ func (s *NodeControllerSuite) TestKubeNodeDown(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -451,10 +446,6 @@ func (s *NodeControllerSuite) TestKubeNodePressure(c *C) {
 					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonKubernetesNodePressure),
 					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
 				},
 			},
 			TestNode2: {
@@ -474,6 +465,8 @@ func (s *NodeControllerSuite) TestKubeNodePressure(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -574,10 +567,6 @@ func (s *NodeControllerSuite) TestUpdateDiskStatus(c *C) {
 					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
 				},
 				DiskStatus: map[string]*longhorn.DiskStatus{
 					TestDiskID1: {
@@ -630,6 +619,8 @@ func (s *NodeControllerSuite) TestUpdateDiskStatus(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -727,10 +718,6 @@ func (s *NodeControllerSuite) TestCleanDiskStatus(c *C) {
 					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
 				},
 				DiskStatus: map[string]*longhorn.DiskStatus{
 					TestDiskID1: {
@@ -779,6 +766,8 @@ func (s *NodeControllerSuite) TestCleanDiskStatus(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -886,10 +875,6 @@ func (s *NodeControllerSuite) TestDisableDiskOnFilesystemChange(c *C) {
 					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
 				},
 				DiskStatus: map[string]*longhorn.DiskStatus{
 					TestDiskID1: {
@@ -938,6 +923,8 @@ func (s *NodeControllerSuite) TestDisableDiskOnFilesystemChange(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -1016,10 +1003,6 @@ func (s *NodeControllerSuite) TestCreateDefaultInstanceManager(c *C) {
 					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
 				},
 				DiskStatus: map[string]*longhorn.DiskStatus{
 					TestDiskID1: {
@@ -1062,6 +1045,8 @@ func (s *NodeControllerSuite) TestCreateDefaultInstanceManager(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -1163,10 +1148,6 @@ func (s *NodeControllerSuite) TestCleanupRedundantInstanceManagers(c *C) {
 					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
 				},
 				DiskStatus: map[string]*longhorn.DiskStatus{
 					TestDiskID1: {
@@ -1210,6 +1191,8 @@ func (s *NodeControllerSuite) TestCleanupRedundantInstanceManagers(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -1280,10 +1263,6 @@ func (s *NodeControllerSuite) TestCleanupAllInstanceManagers(c *C) {
 					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
 					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonCheckKernelConfigFailed),
 				},
 				DiskStatus: map[string]*longhorn.DiskStatus{},
 			},
@@ -1306,6 +1285,8 @@ func (s *NodeControllerSuite) TestCleanupAllInstanceManagers(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -1399,6 +1380,8 @@ func (s *NodeControllerSuite) TestEventOnNotReady(c *C) {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
 			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
 		}
 
 		err = s.controller.syncNode(getKey(node, c))
@@ -1485,6 +1468,8 @@ func (s *NodeControllerSuite) TestEventOnDiskPressure(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -1573,6 +1558,8 @@ func (s *NodeControllerSuite) TestEventOnMemoryPressure(c *C) {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
 			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
 		}
 
 		err = s.controller.syncNode(getKey(node, c))
@@ -1660,6 +1647,8 @@ func (s *NodeControllerSuite) TestEventOnPidPressure(c *C) {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
 			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
 		}
 
 		err = s.controller.syncNode(getKey(node, c))
@@ -1746,6 +1735,8 @@ func (s *NodeControllerSuite) TestEventOnNetworkPressure(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -1839,6 +1830,8 @@ func (s *NodeControllerSuite) TestNoEventOnUnknownTrueNodeCondition(c *C) {
 	for _, node := range fixture.lhNodes {
 		if s.controller.controllerID == node.Name {
 			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
 			c.Assert(err, IsNil)
 		}
 
@@ -1945,25 +1938,36 @@ func (s *NodeControllerSuite) TestSyncInstanceManagers(c *C) {
 	}
 }
 
-func (s *NodeControllerSuite) TestKubeNodeKernelModulesCondition(c *C) {
+func (s *NodeControllerSuite) TestKubeNodeNFSCapabilityCondition(c *C) {
 	var err error
 
-	// Create a temporary Kernel config file
+	// Create a mock kernel config file
 	err = os.MkdirAll(TestKernelConfigDIR, 0755)
 	c.Assert(err, IsNil)
-	tmpKernelConfigFile, err := os.Create(TestKernelConfigFilePath)
-	c.Assert(err, IsNil)
-	defer tmpKernelConfigFile.Close()
-	defer os.Remove(TestKernelConfigFilePath)
+	defer os.RemoveAll(TestKernelConfigFilePath)
 
-	// Write some fake content to the temporary file
-	fakeFileContent := `CONFIG_DM_CRYPT=y
+	// The content of the mock kernel config
+	mockKernelConfigContent := `CONFIG_DM_CRYPT=y
 CONFIG_NFS_V4=m
 CONFIG_NFS_V4_1=m
 CONFIG_NFS_V4_2=y`
 
-	_, err = tmpKernelConfigFile.Write([]byte(fakeFileContent))
+	genKernelConfig := func(content string) {
+		err = os.WriteFile(TestKernelConfigFilePath, []byte(content), 0644)
+		c.Assert(err, IsNil)
+	}
+
+	// Create a mock NFS mount config file
+	err = os.MkdirAll(TestSystemEtcDIR, 0755)
 	c.Assert(err, IsNil)
+	defer os.RemoveAll(TestSystemEtcDIR)
+
+	// The content of the mock NFS mount config
+	genNFSMountConf := func(nfsVer string) {
+		data := fmt.Sprintf("[ NFSMount_Global_Options ]\nDefaultvers=%s\n", nfsVer)
+		err := os.WriteFile(TestNFSMountConfigPath, []byte(data), 0644)
+		c.Assert(err, IsNil)
+	}
 
 	fixture := &NodeControllerFixture{
 		lhNodes: map[string]*longhorn.Node{
@@ -2005,43 +2009,138 @@ CONFIG_NFS_V4_2=y`
 		},
 	}
 
-	expectation := &NodeControllerExpectation{
-		nodeStatus: map[string]*longhorn.NodeStatus{
-			TestNode1: {
-				Conditions: []longhorn.Condition{
-					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonUnknownOS),
-					newNodeCondition(longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusTrue, ""),
-				},
+	s.initTest(c, fixture)
+
+	type nfsConfigCases struct {
+		setup                 func()
+		expectConditionStatus longhorn.ConditionStatus
+		expectConditionReason string
+	}
+	testCases := map[string]nfsConfigCases{
+		"it is acceptable when nfsmount.conf is not present": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				_, err := os.Stat(TestNFSMountConfigPath)
+				c.Assert(os.IsNotExist(err), Equals, true)
 			},
-			TestNode2: {
-				Conditions: []longhorn.Condition{
-					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
-					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
-				},
+			longhorn.ConditionStatusTrue,
+			"",
+		},
+		"it is acceptable when default NFS version set to 4": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("4")
 			},
+			longhorn.ConditionStatusTrue,
+			"",
+		},
+		"it is acceptable when default NFS version set to 4.0": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("4.0")
+			},
+			longhorn.ConditionStatusTrue,
+			"",
+		},
+		"it is acceptable when default NFS version set to 4.1": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("4.1")
+			},
+			longhorn.ConditionStatusTrue,
+			"",
+		},
+		"it is acceptable when default NFS version set to 4.2": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("4.2")
+			},
+			longhorn.ConditionStatusTrue,
+			"",
+		},
+		"it is not acceptable when no kernel module enabled for NFS": {
+			func() {
+				genKernelConfig("CONFIG_DM_CRYPT=y")
+				genNFSMountConf("4.3")
+			},
+			longhorn.ConditionStatusFalse,
+			longhorn.NodeConditionReasonNFSClientIsNotFound,
+		},
+		"it is not acceptable when default NFS version newer than 4.2": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("4.3")
+			},
+			longhorn.ConditionStatusFalse,
+			longhorn.NodeConditionReasonNFSClientIsMisconfigured,
+		},
+		"it is not acceptable when default NFS version older then 4": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("3")
+			},
+			longhorn.ConditionStatusFalse,
+			longhorn.NodeConditionReasonNFSClientIsMisconfigured,
+		},
+		"it is not acceptable when default NFS version illegal value": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("???")
+			},
+			longhorn.ConditionStatusFalse,
+			longhorn.NodeConditionReasonNFSClientIsMisconfigured,
+		},
+		"it is not acceptable when default NFS version empty value": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("")
+			},
+			longhorn.ConditionStatusFalse,
+			longhorn.NodeConditionReasonNFSClientIsMisconfigured,
 		},
 	}
 
-	s.initTest(c, fixture)
+	for testName, testCase := range testCases {
+		fmt.Printf("testing %v", testName)
+		func(setup func(), expectConditionStatus longhorn.ConditionStatus, expectConditionReason string) {
+			setup()
+			defer os.Remove(TestNFSMountConfigPath)
 
-	for _, node := range fixture.lhNodes {
-		if s.controller.controllerID == node.Name {
-			err = s.controller.diskMonitor.RunOnce()
-			c.Assert(err, IsNil)
-		}
+			expectation := &NodeControllerExpectation{
+				nodeStatus: map[string]*longhorn.NodeStatus{
+					TestNode1: {
+						Conditions: []longhorn.Condition{
+							newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+							newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+							newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+						},
+					},
+					TestNode2: {
+						Conditions: []longhorn.Condition{
+							newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+							newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+						},
+					},
+				},
+			}
 
-		err = s.controller.syncNode(getKey(node, c))
-		c.Assert(err, IsNil)
+			for _, node := range fixture.lhNodes {
+				if s.controller.controllerID == node.Name {
+					err = s.controller.diskMonitor.RunOnce()
+					c.Assert(err, IsNil)
+					err = s.controller.environmentCheckMonitor.RunOnce()
+					c.Assert(err, IsNil)
+				}
 
-		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
-		c.Assert(err, IsNil)
+				err = s.controller.syncNode(getKey(node, c))
+				c.Assert(err, IsNil)
 
-		s.checkNodeConditions(c, expectation, n)
+				n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+				c.Assert(err, IsNil)
+
+				s.checkNodeConditions(c, expectation, n)
+			}
+		}(testCase.setup, testCase.expectConditionStatus, testCase.expectConditionReason)
 	}
 }
 
@@ -2232,11 +2331,17 @@ func newTestNodeController(lhClient *lhfake.Clientset, kubeClient *fake.Clientse
 	enqueueNodeForMonitor := func(key string) {
 		nc.queue.Add(key)
 	}
-	mon, err := monitor.NewFakeNodeMonitor(nc.logger, nc.ds, controllerID, enqueueNodeForMonitor)
+	diskMonitor, err := monitor.NewFakeDiskMonitor(nc.logger, nc.ds, controllerID, enqueueNodeForMonitor)
 	if err != nil {
 		return nil, err
 	}
-	nc.diskMonitor = mon
+	nc.diskMonitor = diskMonitor
+
+	environmentCheckMonitor, err := monitor.NewFakeEnvironmentCheckMonitor(nc.logger, nc.ds, controllerID, enqueueNodeForMonitor)
+	if err != nil {
+		return nil, err
+	}
+	nc.environmentCheckMonitor = environmentCheckMonitor
 
 	for index := range nc.cacheSyncs {
 		nc.cacheSyncs[index] = alwaysReady

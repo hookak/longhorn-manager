@@ -105,7 +105,7 @@ func (s *Server) responseWithVolume(rw http.ResponseWriter, req *http.Request, i
 		return err
 	}
 	backups, err := s.m.ListBackupsForVolumeSorted(id)
-	if err != nil {
+	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
 	volumeAttachment, err := s.m.GetVolumeAttachment(v.Name)
@@ -200,6 +200,7 @@ func (s *Server) VolumeCreate(rw http.ResponseWriter, req *http.Request) error {
 		ReplicaDiskSoftAntiAffinity: volume.ReplicaDiskSoftAntiAffinity,
 		DataEngine:                  volume.DataEngine,
 		FreezeFilesystemForSnapshot: volume.FreezeFilesystemForSnapshot,
+		BackupTargetName:            volume.BackupTargetName,
 	}, volume.RecurringJobSelector)
 	if err != nil {
 		return errors.Wrap(err, "failed to create volume")
@@ -824,6 +825,28 @@ func (s *Server) VolumeUpdateFreezeFilesystemForSnapshot(rw http.ResponseWriter,
 
 	obj, err := util.RetryOnConflictCause(func() (interface{}, error) {
 		return s.m.UpdateFreezeFilesystemForSnapshot(id, longhorn.FreezeFilesystemForSnapshot(input.FreezeFilesystemForSnapshot))
+	})
+	if err != nil {
+		return err
+	}
+	v, ok := obj.(*longhorn.Volume)
+	if !ok {
+		return fmt.Errorf("failed to convert to volume %v object", id)
+	}
+	return s.responseWithVolume(rw, req, "", v)
+}
+
+func (s *Server) VolumeUpdateBackupTargetName(rw http.ResponseWriter, req *http.Request) error {
+	var input UpdateBackupTargetInput
+	id := mux.Vars(req)["name"]
+
+	apiContext := api.GetApiContext(req)
+	if err := apiContext.Read(&input); err != nil {
+		return errors.Wrap(err, "failed to read BackupTarget input")
+	}
+
+	obj, err := util.RetryOnConflictCause(func() (interface{}, error) {
+		return s.m.UpdateVolumeBackupTarget(id, input.BackupTargetName)
 	})
 	if err != nil {
 		return err

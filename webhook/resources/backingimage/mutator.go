@@ -3,6 +3,7 @@ package backingimage
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -91,6 +92,14 @@ func (b *backingImageMutator) Create(request *admission.Request, newObj runtime.
 			}
 			parameters[longhorn.DataSourceTypeRestoreParameterConcurrentLimit] = strconv.FormatInt(concurrentLimit, 10)
 		}
+
+		if parameters[longhorn.DataSourceTypeRestoreParameterBackupTargetName] == "" {
+			backupTargetName, err := b.findBackupTargetName(parameters[longhorn.DataSourceTypeRestoreParameterBackupURL])
+			if err != nil {
+				return nil, err
+			}
+			parameters[longhorn.DataSourceTypeRestoreParameterBackupTargetName] = backupTargetName
+		}
 	}
 
 	if longhorn.BackingImageDataSourceType(backingImage.Spec.SourceType) == longhorn.BackingImageDataSourceTypeClone {
@@ -155,9 +164,56 @@ func (b *backingImageMutator) Create(request *admission.Request, newObj runtime.
 		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/minNumberOfCopies", "value": %v}`, minNumberOfCopies))
 	}
 
+	if string(backingImage.Spec.DataEngine) == "" {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/dataEngine", "value": "%s"}`, longhorn.DataEngineTypeV1))
+	}
+
 	patchOps = append(patchOps, patchOp)
 
 	return patchOps, nil
+}
+
+func (b *backingImageMutator) findBackupTargetName(backupURL string) (string, error) {
+	bbis, err := b.ds.ListBackupBackingImagesRO()
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to list backup backing images")
+	}
+
+	backupTargetURL, backingImageName, err := getBackupTargetURLAndBackingImageName(backupURL)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to parse backup URL %v", backupURL)
+	}
+
+	for _, bbi := range bbis {
+		bbiBackupTargetURL, bbiBackingImageName, err := getBackupTargetURLAndBackingImageName(bbi.Status.URL)
+		if err != nil {
+			logrus.WithError(err).Warnf("Failed to parse URL %v of backup backing image %v", bbi.Status.URL, bbi.Name)
+			continue
+		}
+		if backupTargetURL == bbiBackupTargetURL && backingImageName == bbiBackingImageName {
+			return bbi.Spec.BackupTargetName, nil
+		}
+	}
+
+	return "", errors.Errorf("no matching backup found for URL %v and backing image %v", backupTargetURL, backingImageName)
+}
+
+func getBackupTargetURLAndBackingImageName(backupURL string) (string, string, error) {
+	parsedURL, err := url.Parse(backupURL)
+	if err != nil {
+		return "", "", errors.Wrapf(err, "failed to parse backup URL %v", backupURL)
+	}
+	backingImageName := parsedURL.Query().Get("backingImage")
+	if backingImageName == "" {
+		return "", "", errors.Errorf("backup URL %v is missing required 'backingImage' parameter", backupURL)
+	}
+	switch parsedURL.Scheme {
+	case types.BackupStoreTypeCIFS, types.BackupStoreTypeNFS, types.BackupStoreTypeAZBlob, types.BackupStoreTypeS3:
+		parsedURL.RawQuery = ""
+		return parsedURL.String(), backingImageName, nil
+	default:
+		return "", "", errors.Errorf("unsupported backupURL scheme %v", parsedURL.Scheme)
+	}
 }
 
 func (b *backingImageMutator) Update(request *admission.Request, oldObj runtime.Object, newObj runtime.Object) (admission.PatchOps, error) {
@@ -183,6 +239,11 @@ func (b *backingImageMutator) Update(request *admission.Request, oldObj runtime.
 			err := fmt.Errorf("changing secret namespace for BackingImage %v is not supported", oldBackingImage.Name)
 			return nil, werror.NewInvalidError(err.Error(), "")
 		}
+	}
+
+	if oldBackingImage.Spec.DataEngine != backingImage.Spec.DataEngine {
+		err := fmt.Errorf("changing data engine for BackingImage %v is not supported", oldBackingImage.Name)
+		return nil, werror.NewInvalidError(err.Error(), "")
 	}
 
 	var patchOps admission.PatchOps

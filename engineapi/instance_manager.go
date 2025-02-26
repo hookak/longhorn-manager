@@ -451,7 +451,6 @@ type EngineInstanceCreateRequest struct {
 	EngineReplicaTimeout             int64
 	ReplicaFileSyncHTTPClientTimeout int64
 	DataLocality                     longhorn.DataLocality
-	ImIP                             string
 	EngineCLIAPIVersion              int
 	UpgradeRequired                  bool
 	InitiatorAddress                 string
@@ -529,7 +528,6 @@ type ReplicaInstanceCreateRequest struct {
 	DataPath            string
 	BackingImagePath    string
 	DataLocality        longhorn.DataLocality
-	ImIP                string
 	EngineCLIAPIVersion int
 }
 
@@ -573,8 +571,9 @@ func (c *InstanceManagerClient) ReplicaInstanceCreate(req *ReplicaInstanceCreate
 		BinaryArgs: args,
 
 		Replica: imclient.ReplicaCreateRequest{
-			DiskName: req.DiskName,
-			DiskUUID: req.Replica.Spec.DiskID,
+			DiskName:         req.DiskName,
+			DiskUUID:         req.Replica.Spec.DiskID,
+			BackingImageName: req.Replica.Spec.BackingImage,
 		},
 	})
 	if err != nil {

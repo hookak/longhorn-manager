@@ -16,18 +16,23 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"k8s.io/client-go/rest"
 	"k8s.io/mount-utils"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
 	utilexec "k8s.io/utils/exec"
 
 	"github.com/longhorn/longhorn-manager/csi/crypto"
+	"github.com/longhorn/longhorn-manager/engineapi"
 	"github.com/longhorn/longhorn-manager/types"
 
 	lhns "github.com/longhorn/go-common-libs/ns"
 
 	longhornclient "github.com/longhorn/longhorn-manager/client"
 	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	lhclientset "github.com/longhorn/longhorn-manager/k8s/pkg/client/clientset/versioned"
 )
 
 const (
@@ -49,13 +54,36 @@ var supportedFs = map[string]fsParameters{
 
 type NodeServer struct {
 	csi.UnimplementedNodeServer
-	apiClient *longhornclient.RancherClient
-	nodeID    string
-	caps      []*csi.NodeServiceCapability
-	log       *logrus.Entry
+	apiClient   *longhornclient.RancherClient
+	nodeID      string
+	caps        []*csi.NodeServiceCapability
+	log         *logrus.Entry
+	lhNamespace string
+	kubeClient  *clientset.Clientset
+	lhClient    *lhclientset.Clientset
 }
 
-func NewNodeServer(apiClient *longhornclient.RancherClient, nodeID string) *NodeServer {
+func NewNodeServer(apiClient *longhornclient.RancherClient, nodeID string) (*NodeServer, error) {
+	lhNamespace := os.Getenv(types.EnvPodNamespace)
+	if lhNamespace == "" {
+		return nil, fmt.Errorf("failed to detect pod namespace, environment variable %v is missing", types.EnvPodNamespace)
+	}
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get client config")
+	}
+
+	kubeClient, err := clientset.NewForConfig(config)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get k8s client")
+	}
+
+	lhClient, err := lhclientset.NewForConfig(config)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get longhorn clientset")
+	}
+
 	return &NodeServer{
 		apiClient: apiClient,
 		nodeID:    nodeID,
@@ -65,8 +93,11 @@ func NewNodeServer(apiClient *longhornclient.RancherClient, nodeID string) *Node
 				csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
 				csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
 			}),
-		log: logrus.StandardLogger().WithField("component", "csi-node-server"),
-	}
+		log:         logrus.StandardLogger().WithField("component", "csi-node-server"),
+		lhNamespace: lhNamespace,
+		kubeClient:  kubeClient,
+		lhClient:    lhClient,
+	}, nil
 }
 
 // NodePublishVolume will mount the volume /dev/longhorn/<volume_name> to target_path
@@ -308,6 +339,10 @@ func (ns *NodeServer) nodeStageMountVolume(volumeID, devicePath, stagingTargetPa
 		return nil
 	}
 
+	if _, err := os.Stat(devicePath); err != nil {
+		return status.Error(codes.Internal, errors.Wrapf(err, "failed to check if device %v exists", devicePath).Error())
+	}
+
 	log.Infof("Formatting device %v with fsType %v and mounting at %v with mount flags %v", devicePath, fsType, stagingTargetPath, mountFlags)
 	if err := mounter.FormatAndMount(devicePath, stagingTargetPath, fsType, mountFlags); err != nil {
 		return status.Error(codes.Internal, err.Error())
@@ -457,7 +492,8 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Errorf(codes.Internal, "failed to evaluate device filesystem %v format: %v", devicePath, err)
 	}
 
-	log.Infof("Volume %v device %v contains filesystem of format %v", volumeID, devicePath, diskFormat)
+	dataEngine := volume.DataEngine
+	log.Infof("Volume %v (%v) device %v contains filesystem of format %v", volumeID, dataEngine, devicePath, diskFormat)
 
 	if volume.Encrypted {
 		secrets := req.GetSecrets()
@@ -484,7 +520,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			}
 		}
 
-		cryptoDevice := crypto.VolumeMapper(volumeID)
+		cryptoDevice := crypto.VolumeMapper(volumeID, dataEngine)
 		log.Infof("Volume %s requires crypto device %s", volumeID, cryptoDevice)
 
 		// check if the crypto device is open at the null path.
@@ -494,12 +530,12 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			return nil, status.Errorf(codes.Internal, "failed to check if the crypto device %s for volume %s is mapped to the null path: %v", cryptoDevice, volumeID, err.Error())
 		} else if mappedToNullPath {
 			log.Warnf("Closing active crypto device %s for volume %s since the volume is not closed properly before", cryptoDevice, volumeID)
-			if err := crypto.CloseVolume(volumeID); err != nil {
+			if err := crypto.CloseVolume(volumeID, dataEngine); err != nil {
 				return nil, status.Errorf(codes.Internal, "failed to close active crypto device %s for volume %s: %v ", cryptoDevice, volumeID, err.Error())
 			}
 		}
 
-		if err := crypto.OpenVolume(volumeID, devicePath, passphrase); err != nil {
+		if err := crypto.OpenVolume(volumeID, dataEngine, devicePath, passphrase); err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 
@@ -597,19 +633,20 @@ func (ns *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	// optionally try to retrieve the volume and check if it's an RWX volume
 	// if it is we let the share-manager clean up the crypto device
 	volume, _ := ns.apiClient.Volume.ById(volumeID)
-	if volume == nil || types.IsDataEngineV1(longhorn.DataEngineType(volume.DataEngine)) {
-		// Currently, only "RWO v1 volumes" and "block device with v1 volume.Migratable is true" supports encryption.
-		sharedAccess := requiresSharedAccess(volume, nil)
-		cleanupCryptoDevice := !sharedAccess || (sharedAccess && volume.Migratable)
-		if cleanupCryptoDevice {
-			cryptoDevice := crypto.VolumeMapper(volumeID)
-			if isOpen, err := crypto.IsDeviceOpen(cryptoDevice); err != nil {
+	dataEngine := string(longhorn.DataEngineTypeV1)
+	if volume != nil {
+		dataEngine = volume.DataEngine
+	}
+	sharedAccess := requiresSharedAccess(volume, nil)
+	cleanupCryptoDevice := !sharedAccess || (sharedAccess && volume.Migratable)
+	if cleanupCryptoDevice {
+		cryptoDevice := crypto.VolumeMapper(volumeID, dataEngine)
+		if isOpen, err := crypto.IsDeviceOpen(cryptoDevice); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		} else if isOpen {
+			log.Infof("Volume %s closing active crypto device %s", volumeID, cryptoDevice)
+			if err := crypto.CloseVolume(volumeID, dataEngine); err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
-			} else if isOpen {
-				log.Infof("Volume %s closing active crypto device %s", volumeID, cryptoDevice)
-				if err := crypto.CloseVolume(volumeID); err != nil {
-					return nil, status.Error(codes.Internal, err.Error())
-				}
 			}
 		}
 	}
@@ -690,11 +727,46 @@ func (ns *NodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVo
 	}, nil
 }
 
+// NodeExpandShared Volume is designed to expand the file system in an RWX volume for ONLINE expansion.
+// It does so with a gRPC call into the share-manager pod.
+func (ns *NodeServer) NodeExpandSharedVolume(volumeName string) error {
+	log := ns.log.WithFields(logrus.Fields{"function": "NodeExpandSharedVolume"})
+
+	sm, err := ns.lhClient.LonghornV1beta2().ShareManagers(ns.lhNamespace).Get(context.TODO(), volumeName, metav1.GetOptions{})
+	if err != nil {
+		return errors.Wrap(err, "failed to get ShareManager CR")
+	}
+
+	podName := types.GetShareManagerPodNameFromShareManagerName(sm.Name)
+	pod, err := ns.kubeClient.CoreV1().Pods(ns.lhNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	if err != nil {
+		return errors.Wrap(err, "failed to get ShareManager pod")
+	}
+
+	client, err := engineapi.NewShareManagerClient(sm, pod)
+	if err != nil {
+		return errors.Wrapf(err, "failed to launch gRPC client for share manager before resizing volume %v", volumeName)
+	}
+	defer client.Close()
+
+	// Each node with a workload pod will send an RPC request.  The first will win, and the others are no-ops.
+	err = client.FilesystemResize()
+	if status.Code(err) == codes.Unimplemented {
+		// This is a downrev longhorn-share-manager image.  It will be necessary either to kill the share-manager pod
+		// and let it restart with the new image, or scale the workload down and back up to accomplish the same thing.
+		// It might be tempting to delete the pod here, but there will be one of these calls for each workload pod,
+		// and it would be messy to have multiple kill requests at once.  So the kill will need to be done by the user.
+		log.WithError(err).Warn("Share Manager image is down-rev, does not implement RPC FilesystemResize.  Share Manager pod must be restarted with current image.")
+	}
+
+	return errors.Wrapf(err, "failed to expand shared volume %v", volumeName)
+}
+
 // NodeExpandVolume is designed to expand the file system for ONLINE expansion,
 func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	log := ns.log.WithFields(logrus.Fields{"function": "NodeExpandVolume"})
 
-	log.Infof("NodeNodeExpandVolume is called with req %+v", req)
+	log.Infof("NodeExpandVolume is called with req %+v", req)
 
 	if req.CapacityRange == nil {
 		return nil, status.Error(codes.InvalidArgument, "capacity range missing in request")
@@ -729,6 +801,20 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 	if volume.State != string(longhorn.VolumeStateAttached) {
 		return nil, status.Errorf(codes.FailedPrecondition, "invalid state %v for volume %v node expansion", volume.State, volumeID)
 	}
+
+	if requiresSharedAccess(volume, volumeCapability) && !volume.Migratable {
+		if volume.AccessMode != string(longhorn.AccessModeReadWriteMany) {
+			return nil, status.Errorf(codes.FailedPrecondition, "volume %s requires shared access but is not marked for shared use", volumeID)
+		}
+
+		if err := ns.NodeExpandSharedVolume(volumeID); err != nil {
+			log.WithError(err).Errorf("failed to expand shared volume %v", volumeID)
+			return nil, err
+		}
+
+		return &csi.NodeExpandVolumeResponse{CapacityBytes: requestedSize}, nil
+	}
+
 	devicePath := volume.Controllers[0].Endpoint
 
 	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: utilexec.New()}
@@ -740,6 +826,7 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		return nil, fmt.Errorf("unknown filesystem type for volume %v node expansion", volumeID)
 	}
 
+	dataEngine := volume.DataEngine
 	devicePath, err = func() (string, error) {
 		if !volume.Encrypted {
 			return devicePath, nil
@@ -747,7 +834,7 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		if diskFormat != "crypto_LUKS" {
 			return "", status.Errorf(codes.InvalidArgument, "unsupported disk encryption format %v", diskFormat)
 		}
-		devicePath = crypto.VolumeMapper(volumeID)
+		devicePath = crypto.VolumeMapper(volumeID, dataEngine)
 
 		// Need to enable feature gate in v1.25:
 		// https://github.com/kubernetes/enhancements/issues/3107
@@ -767,7 +854,7 @@ func (ns *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		}
 
 		// blindly resize the encrypto device
-		if err := crypto.ResizeEncryptoDevice(volumeID, passphrase); err != nil {
+		if err := crypto.ResizeEncryptoDevice(volumeID, dataEngine, passphrase); err != nil {
 			return "", status.Errorf(codes.InvalidArgument, "failed to resize crypto device %v for volume %v node expansion: %v", devicePath, volumeID, err)
 		}
 

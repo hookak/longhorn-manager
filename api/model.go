@@ -61,6 +61,7 @@ type Volume struct {
 	SnapshotMaxCount            int                                    `json:"snapshotMaxCount"`
 	SnapshotMaxSize             string                                 `json:"snapshotMaxSize"`
 	FreezeFilesystemForSnapshot longhorn.FreezeFilesystemForSnapshot   `json:"freezeFilesystemForSnapshot"`
+	BackupTargetName            string                                 `json:"backupTargetName"`
 
 	DiskSelector         []string                      `json:"diskSelector"`
 	NodeSelector         []string                      `json:"nodeSelector"`
@@ -139,6 +140,8 @@ type BackupVolume struct {
 	BackingImageName     string            `json:"backingImageName"`
 	BackingImageChecksum string            `json:"backingImageChecksum"`
 	StorageClassName     string            `json:"storageClassName"`
+	BackupTargetName     string            `json:"backupTargetName"`
+	VolumeName           string            `json:"volumeName"`
 }
 
 // SyncBackupResource is used for the Backup*Sync* actions
@@ -171,6 +174,7 @@ type Backup struct {
 	CompressionMethod      string               `json:"compressionMethod"`
 	NewlyUploadedDataSize  string               `json:"newlyUploadDataSize"`
 	ReUploadedDataSize     string               `json:"reUploadedDataSize"`
+	BackupTargetName       string               `json:"backupTargetName"`
 }
 
 type BackupBackingImage struct {
@@ -187,6 +191,8 @@ type BackupBackingImage struct {
 	CompressionMethod string               `json:"compressionMethod"`
 	Secret            string               `json:"secret"`
 	SecretNamespace   string               `json:"secretNamespace"`
+	BackingImageName  string               `json:"backingImageName"`
+	BackupTargetName  string               `json:"backupTargetName"`
 }
 
 type Setting struct {
@@ -266,6 +272,7 @@ type BackingImage struct {
 	NodeSelector      []string          `json:"nodeSelector"`
 	MinNumberOfCopies int               `json:"minNumberOfCopies"`
 	ExpectedChecksum  string            `json:"expectedChecksum"`
+	DataEngine        string            `json:"dataEngine"`
 
 	DiskFileStatusMap map[string]longhorn.BackingImageDiskFileStatus `json:"diskFileStatusMap"`
 	Size              int64                                          `json:"size"`
@@ -288,6 +295,7 @@ type UpdateMinNumberOfCopiesInput struct {
 type BackingImageRestoreInput struct {
 	Secret          string `json:"secret"`
 	SecretNamespace string `json:"secretNamespace"`
+	DataEngine      string `json:"dataEngine"`
 }
 
 type AttachInput struct {
@@ -391,6 +399,10 @@ type UpdateFreezeFilesystemForSnapshotInput struct {
 	FreezeFilesystemForSnapshot string `json:"freezeFilesystemForSnapshot"`
 }
 
+type UpdateBackupTargetInput struct {
+	BackupTargetName string `json:"backupTargetName"`
+}
+
 type PVCreateInput struct {
 	PVName string `json:"pvName"`
 	FSType string `json:"fsType"`
@@ -430,12 +442,13 @@ type Node struct {
 }
 
 type DiskStatus struct {
-	Conditions       map[string]longhorn.Condition `json:"conditions"`
-	StorageAvailable int64                         `json:"storageAvailable"`
-	StorageScheduled int64                         `json:"storageScheduled"`
-	StorageMaximum   int64                         `json:"storageMaximum"`
-	ScheduledReplica map[string]int64              `json:"scheduledReplica"`
-	DiskUUID         string                        `json:"diskUUID"`
+	Conditions            map[string]longhorn.Condition `json:"conditions"`
+	StorageAvailable      int64                         `json:"storageAvailable"`
+	StorageScheduled      int64                         `json:"storageScheduled"`
+	StorageMaximum        int64                         `json:"storageMaximum"`
+	ScheduledReplica      map[string]int64              `json:"scheduledReplica"`
+	ScheduledBackingImage map[string]int64              `json:"scheduledBackingImage"`
+	DiskUUID              string                        `json:"diskUUID"`
 }
 
 type DiskInfo struct {
@@ -650,6 +663,7 @@ func NewSchema() *client.Schemas {
 	schemas.AddType("UpdateReplicaZoneSoftAntiAffinityInput", UpdateReplicaZoneSoftAntiAffinityInput{})
 	schemas.AddType("UpdateReplicaDiskSoftAntiAffinityInput", UpdateReplicaDiskSoftAntiAffinityInput{})
 	schemas.AddType("UpdateFreezeFilesystemForSnapshotInput", UpdateFreezeFilesystemForSnapshotInput{})
+	schemas.AddType("UpdateBackupTargetInput", UpdateBackupTargetInput{})
 	schemas.AddType("workloadStatus", longhorn.WorkloadStatus{})
 	schemas.AddType("cloneStatus", longhorn.VolumeCloneStatus{})
 	schemas.AddType("empty", Empty{})
@@ -871,12 +885,37 @@ func kubernetesStatusSchema(status *client.Schema) {
 }
 
 func backupTargetSchema(backupTarget *client.Schema) {
-	backupTarget.CollectionMethods = []string{"GET"}
-	backupTarget.ResourceMethods = []string{"GET", "PUT"}
+	backupTarget.CollectionMethods = []string{"GET", "POST"}
+	backupTarget.ResourceMethods = []string{"GET", "PUT", "DELETE"}
+
+	backupTargetName := backupTarget.ResourceFields["name"]
+	backupTargetName.Required = true
+	backupTargetName.Unique = true
+	backupTargetName.Create = true
+	backupTarget.ResourceFields["name"] = backupTargetName
+
+	backupTargetURL := backupTarget.ResourceFields["backupTargetURL"]
+	backupTargetURL.Create = true
+	backupTargetURL.Default = ""
+	backupTarget.ResourceFields["backupTargetURL"] = backupTargetURL
+
+	credentialSecret := backupTarget.ResourceFields["credentialSecret"]
+	credentialSecret.Create = true
+	credentialSecret.Default = ""
+	backupTarget.ResourceFields["credentialSecret"] = credentialSecret
+
+	backupTargetPollInterval := backupTarget.ResourceFields["pollInterval"]
+	backupTargetPollInterval.Create = true
+	backupTargetPollInterval.Default = "300"
+	backupTarget.ResourceFields["pollInterval"] = backupTargetPollInterval
 
 	backupTarget.ResourceActions = map[string]client.Action{
 		"backupTargetSync": {
 			Input:  "syncBackupResource",
+			Output: "backupTargetListOutput",
+		},
+		"backupTargetUpdate": {
+			Input:  "BackupTarget",
 			Output: "backupTargetListOutput",
 		},
 	}
@@ -1063,6 +1102,10 @@ func volumeSchema(volume *client.Schema) {
 
 		"updateFreezeFilesystemForSnapshot": {
 			Input: "UpdateFreezeFilesystemForSnapshotInput",
+		},
+
+		"updateBackupTargetName": {
+			Input: "UpdateBackupTargetInput",
 		},
 
 		"pvCreate": {
@@ -1448,8 +1491,16 @@ func toVolumeResource(v *longhorn.Volume, ves []*longhorn.Engine, vrs []*longhor
 		}
 	}
 
+	allReplicaScheduled := true
+	if len(vrs) == 0 {
+		allReplicaScheduled = false
+	}
 	replicas := []Replica{}
 	for _, r := range vrs {
+		if r.Spec.NodeID == "" {
+			allReplicaScheduled = false
+		}
+
 		mode := ""
 		if ve != nil && ve.Status.ReplicaModeMap != nil {
 			mode = string(ve.Status.ReplicaModeMap[r.Name])
@@ -1525,7 +1576,7 @@ func toVolumeResource(v *longhorn.Volume, ves []*longhorn.Engine, vrs []*longhor
 	isCloningDesired := types.IsDataFromVolume(v.Spec.DataSource)
 	isCloningCompleted := v.Status.CloneStatus.State == longhorn.VolumeCloneStateCompleted
 	if (v.Spec.NodeID == "" && v.Status.State != longhorn.VolumeStateDetached) ||
-		(v.Status.State == longhorn.VolumeStateDetached && scheduledCondition.Status != longhorn.ConditionStatusTrue) ||
+		(v.Status.State == longhorn.VolumeStateDetached && (scheduledCondition.Status != longhorn.ConditionStatusTrue && !allReplicaScheduled)) ||
 		v.Status.Robustness == longhorn.VolumeRobustnessFaulted ||
 		v.Status.RestoreRequired ||
 		(isCloningDesired && !isCloningCompleted) {
@@ -1562,6 +1613,7 @@ func toVolumeResource(v *longhorn.Volume, ves []*longhorn.Engine, vrs []*longhor
 		NodeSelector:                v.Spec.NodeSelector,
 		RestoreVolumeRecurringJob:   v.Spec.RestoreVolumeRecurringJob,
 		FreezeFilesystemForSnapshot: v.Spec.FreezeFilesystemForSnapshot,
+		BackupTargetName:            v.Spec.BackupTargetName,
 
 		State:                       v.Status.State,
 		Robustness:                  v.Status.Robustness,
@@ -1637,6 +1689,7 @@ func toVolumeResource(v *longhorn.Volume, ves []*longhorn.Engine, vrs []*longhor
 			actions["updateReplicaZoneSoftAntiAffinity"] = struct{}{}
 			actions["updateReplicaDiskSoftAntiAffinity"] = struct{}{}
 			actions["updateFreezeFilesystemForSnapshot"] = struct{}{}
+			actions["updateBackupTargetName"] = struct{}{}
 			actions["recurringJobAdd"] = struct{}{}
 			actions["recurringJobDelete"] = struct{}{}
 			actions["recurringJobList"] = struct{}{}
@@ -1668,6 +1721,7 @@ func toVolumeResource(v *longhorn.Volume, ves []*longhorn.Engine, vrs []*longhor
 			actions["updateReplicaZoneSoftAntiAffinity"] = struct{}{}
 			actions["updateReplicaDiskSoftAntiAffinity"] = struct{}{}
 			actions["updateFreezeFilesystemForSnapshot"] = struct{}{}
+			actions["updateBackupTargetName"] = struct{}{}
 			actions["pvCreate"] = struct{}{}
 			actions["pvcCreate"] = struct{}{}
 			actions["cancelExpansion"] = struct{}{}
@@ -1801,7 +1855,8 @@ func toBackupTargetResource(bt *longhorn.BackupTarget, apiContext *api.ApiContex
 		},
 	}
 	res.Actions = map[string]string{
-		"backupTargetSync": apiContext.UrlBuilder.ActionLink(res.Resource, "backupTargetSync"),
+		"backupTargetSync":   apiContext.UrlBuilder.ActionLink(res.Resource, "backupTargetSync"),
+		"backupTargetUpdate": apiContext.UrlBuilder.ActionLink(res.Resource, "backupTargetUpdate"),
 	}
 
 	return res
@@ -1828,6 +1883,8 @@ func toBackupVolumeResource(bv *longhorn.BackupVolume, apiContext *api.ApiContex
 		BackingImageName:     bv.Status.BackingImageName,
 		BackingImageChecksum: bv.Status.BackingImageChecksum,
 		StorageClassName:     bv.Status.StorageClassName,
+		BackupTargetName:     bv.Spec.BackupTargetName,
+		VolumeName:           bv.Spec.VolumeName,
 	}
 	b.Actions = map[string]string{
 		"backupList":       apiContext.UrlBuilder.ActionLink(b.Resource, "backupList"),
@@ -1877,6 +1934,8 @@ func toBackupBackingImageResource(bbi *longhorn.BackupBackingImage, apiContext *
 		CompressionMethod: string(bbi.Status.CompressionMethod),
 		Secret:            bbi.Status.Secret,
 		SecretNamespace:   bbi.Status.SecretNamespace,
+		BackingImageName:  bbi.Spec.BackingImage,
+		BackupTargetName:  bbi.Spec.BackupTargetName,
 	}
 
 	backupBackingImage.Actions = map[string]string{
@@ -1898,6 +1957,19 @@ func toBackupBackingImageCollection(bbis []*longhorn.BackupBackingImage, apiCont
 func toBackupResource(b *longhorn.Backup) *Backup {
 	if b == nil {
 		return nil
+	}
+
+	// For frontend, it will use the backup target name and volume name to tell this backup is belong to which backup volume.
+	// The backup not in `completed` state will not have the backup target name and volume name in `Status`.
+	backupTargetName := b.Status.BackupTargetName
+	volumeName := b.Status.VolumeName
+	if b.Labels != nil {
+		if backupTargetName == "" {
+			backupTargetName = b.Labels[types.LonghornLabelBackupTarget]
+		}
+		if volumeName == "" {
+			volumeName = b.Labels[types.LonghornLabelBackupVolume]
+		}
 	}
 
 	getSnapshotNameFromBackup := func(b *longhorn.Backup) string {
@@ -1925,21 +1997,22 @@ func toBackupResource(b *longhorn.Backup) *Backup {
 		Labels:                 b.Status.Labels,
 		BackupMode:             b.Spec.BackupMode,
 		Messages:               b.Status.Messages,
-		VolumeName:             b.Status.VolumeName,
+		VolumeName:             volumeName,
 		VolumeSize:             b.Status.VolumeSize,
 		VolumeCreated:          b.Status.VolumeCreated,
 		VolumeBackingImageName: b.Status.VolumeBackingImageName,
 		CompressionMethod:      string(b.Status.CompressionMethod),
 		NewlyUploadedDataSize:  b.Status.NewlyUploadedDataSize,
 		ReUploadedDataSize:     b.Status.ReUploadedDataSize,
+		BackupTargetName:       backupTargetName,
 	}
 	// Set the volume name from backup CR's label if it's empty.
 	// This field is empty probably because the backup state is not Ready
 	// or the content of the backup config is empty.
 	if ret.VolumeName == "" {
-		backupVolumeName, ok := b.Labels[types.LonghornLabelBackupVolume]
+		volumeName, ok := b.Labels[types.LonghornLabelBackupVolume]
 		if ok {
-			ret.VolumeName = backupVolumeName
+			ret.VolumeName = volumeName
 		}
 	}
 	return ret
@@ -2011,6 +2084,7 @@ func toBackingImageResource(bi *longhorn.BackingImage, apiContext *api.ApiContex
 		MinNumberOfCopies: bi.Spec.MinNumberOfCopies,
 		NodeSelector:      bi.Spec.NodeSelector,
 		DiskSelector:      bi.Spec.DiskSelector,
+		DataEngine:        string(bi.Spec.DataEngine),
 
 		DiskFileStatusMap: diskFileStatusMap,
 		Size:              bi.Status.Size,
@@ -2080,12 +2154,13 @@ func toNodeResource(node *longhorn.Node, address string, apiContext *api.ApiCont
 		}
 		if node.Status.DiskStatus != nil && node.Status.DiskStatus[name] != nil {
 			di.DiskStatus = DiskStatus{
-				Conditions:       sliceToMap(node.Status.DiskStatus[name].Conditions),
-				StorageAvailable: node.Status.DiskStatus[name].StorageAvailable,
-				StorageScheduled: node.Status.DiskStatus[name].StorageScheduled,
-				StorageMaximum:   node.Status.DiskStatus[name].StorageMaximum,
-				ScheduledReplica: node.Status.DiskStatus[name].ScheduledReplica,
-				DiskUUID:         node.Status.DiskStatus[name].DiskUUID,
+				Conditions:            sliceToMap(node.Status.DiskStatus[name].Conditions),
+				StorageAvailable:      node.Status.DiskStatus[name].StorageAvailable,
+				StorageScheduled:      node.Status.DiskStatus[name].StorageScheduled,
+				StorageMaximum:        node.Status.DiskStatus[name].StorageMaximum,
+				ScheduledReplica:      node.Status.DiskStatus[name].ScheduledReplica,
+				ScheduledBackingImage: node.Status.DiskStatus[name].ScheduledBackingImage,
+				DiskUUID:              node.Status.DiskStatus[name].DiskUUID,
 			}
 		}
 		disks[name] = di

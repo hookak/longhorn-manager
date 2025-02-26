@@ -749,7 +749,7 @@ func (c *VolumeController) ReconcileEngineReplicaState(v *longhorn.Volume, es ma
 			} else {
 				after, err := util.TimestampAfterTimestamp(transitionTime, r.Spec.LastHealthyAt)
 				if err != nil {
-					log.WithError(err).Errorf("Failed to check if replica %v transitioned to mode %v after it was last healthy", r.Name, mode)
+					log.WithError(err).Warnf("Failed to check if replica %v transitioned to mode %v after it was last healthy", r.Name, mode)
 				}
 				if after || err != nil {
 					r.Spec.LastHealthyAt = now
@@ -758,6 +758,26 @@ func (c *VolumeController) ReconcileEngineReplicaState(v *longhorn.Volume, es ma
 			healthyCount++
 		}
 	}
+
+	if areAllReplicaUnknownAndErrored(e.Status.ReplicaModeMap) {
+		shouldLogWarning := false
+		for _, r := range rs {
+			if r.Spec.EngineName != e.Name {
+				continue
+			}
+			if r.Spec.FailedAt == "" {
+				setReplicaFailedAt(r, c.nowHandler())
+				e.Spec.LogRequested = true
+				r.Spec.LogRequested = true
+				shouldLogWarning = true
+			}
+			r.Spec.DesireState = longhorn.InstanceStateStopped
+		}
+		if shouldLogWarning {
+			log.Warn("All replica in engine's ReplicaModeMap are unknown and errored. Marking all replicas of the engine as failed")
+		}
+	}
+
 	// If a replica failed at attaching/migrating stage,
 	// there is no record in e.Status.ReplicaModeMap
 	for _, r := range rs {
@@ -852,6 +872,18 @@ func (c *VolumeController) ReconcileEngineReplicaState(v *longhorn.Volume, es ma
 	}
 
 	return nil
+}
+
+func areAllReplicaUnknownAndErrored(replicaModeMap map[string]longhorn.ReplicaMode) bool {
+	for rName, mode := range replicaModeMap {
+		if !strings.HasPrefix(rName, unknownReplicaPrefix) {
+			return false
+		}
+		if mode != longhorn.ReplicaModeERR {
+			return false
+		}
+	}
+	return true
 }
 
 func isAutoSalvageNeeded(rs map[string]*longhorn.Replica) bool {
@@ -1480,7 +1512,7 @@ func (c *VolumeController) handleDelinquentAndStaleStateForFaultedRWXVolume(v *l
 	if !isRegularRWXVolume(v) {
 		return nil
 	}
-	return c.ds.ClearDelinquentAndStaleStateIfVolumeIsDelinquent(v.Name)
+	return c.ds.ClearDelinquentAndStaleStateIfVolumeIsDelinquent(v.Name, "")
 }
 
 func (c *VolumeController) requestRemountIfFileSystemReadOnly(v *longhorn.Volume, e *longhorn.Engine) {
@@ -2363,7 +2395,9 @@ func (c *VolumeController) getReplicaCountForAutoBalanceLeastEffort(v *longhorn.
 	}
 
 	if v.Status.Robustness != longhorn.VolumeRobustnessHealthy {
-		log.Warnf("Failed to auto-balance volume in %s state", v.Status.Robustness)
+		if v.Status.State != longhorn.VolumeStateDetached {
+			log.Warnf("Failed to auto-balance volume in %s state", v.Status.Robustness)
+		}
 		return 0
 	}
 
@@ -2934,7 +2968,9 @@ func (c *VolumeController) getNodeCandidatesForAutoBalanceZone(v *longhorn.Volum
 	}
 
 	if v.Status.Robustness != longhorn.VolumeRobustnessHealthy {
-		log.Warnf("Failed to auto-balance volume in %s state", v.Status.Robustness)
+		if v.Status.State != longhorn.VolumeStateDetached { // Detached volumes are not "healthy". Hence, it would cause excessive logging periodically for detached volumes
+			log.Warnf("Failed to auto-balance volume in %s robustness and %s state", v.Status.Robustness, v.Status.State)
+		}
 		return candidateNames
 	}
 
@@ -3621,15 +3657,20 @@ func (c *VolumeController) createEngine(v *longhorn.Volume, currentEngineName st
 	}
 
 	if v.Spec.FromBackup != "" && v.Status.RestoreRequired {
-		backupVolumeName, backupName, err := c.getInfoFromBackupURL(v)
+		canonicalBVName, backupVolumeName, backupName, err := c.getBackupVolumeInfo(v)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to get backup volume when creating engine object of restored volume %v", v.Name)
+			return nil, errors.Wrapf(err, "failed to get backup volume information for restoring volume %v", v.Name)
 		}
+
 		engine.Spec.BackupVolume = backupVolumeName
 		engine.Spec.RequestedBackupRestore = backupName
 
-		log.Infof("Creating engine %v for restored volume, BackupVolume is %v, RequestedBackupRestore is %v",
-			engine.Name, engine.Spec.BackupVolume, engine.Spec.RequestedBackupRestore)
+		log.WithFields(logrus.Fields{
+			"backupVolume":       engine.Spec.BackupVolume,
+			"backupVolumeRemote": canonicalBVName,
+			"engine":             engine.Name,
+			"restoreBackup":      engine.Spec.RequestedBackupRestore,
+		}).Info("Creating engine for restored volume")
 	}
 
 	unmapMarkEnabled, err := c.isUnmapMarkSnapChainRemovedEnabled(v)
@@ -3643,6 +3684,25 @@ func (c *VolumeController) createEngine(v *longhorn.Volume, currentEngineName st
 	}
 
 	return c.ds.CreateEngine(engine)
+}
+
+func (c *VolumeController) getBackupVolumeInfo(v *longhorn.Volume) (string, string, string, error) {
+	canonicalBVName, backupName, err := c.getInfoFromBackupURL(v)
+	if err != nil {
+		return "", "", "", errors.Wrapf(err, "failed to parse backup URL %v for restoring volume %v", v.Spec.FromBackup, v.Name)
+	}
+
+	backup, err := c.ds.GetBackupRO(backupName)
+	if err != nil {
+		return "", "", "", errors.Wrapf(err, "failed to get backup %v for restoring volume %v", backupName, v.Name)
+	}
+
+	backupVolume, err := c.ds.GetBackupVolumeByBackupTargetAndVolumeRO(backup.Status.BackupTargetName, canonicalBVName)
+	if err != nil {
+		return "", "", "", errors.Wrapf(err, "failed to get backup volume %v with backup target %v for restoring volume %v", canonicalBVName, backup.Status.BackupTargetName, v.Name)
+	}
+
+	return canonicalBVName, backupVolume.Name, backupName, nil
 }
 
 func (c *VolumeController) newReplica(v *longhorn.Volume, e *longhorn.Engine, hardNodeAffinity string) *longhorn.Replica {
@@ -3858,15 +3918,17 @@ func (c *VolumeController) restoreVolumeRecurringJobs(v *longhorn.Volume) error 
 	log := getLoggerForVolume(c.logger, v)
 
 	backupVolumeRecurringJobsInfo := make(map[string]longhorn.VolumeRecurringJobInfo)
-	bvName, exist := v.Labels[types.LonghornLabelBackupVolume]
+	btName := v.Spec.BackupTargetName
+
+	volName, exist := v.Labels[types.LonghornLabelBackupVolume]
 	if !exist {
 		log.Warn("Failed to find the backup volume label")
 		return nil
 	}
 
-	bv, err := c.ds.GetBackupVolumeRO(bvName)
+	bv, err := c.ds.GetBackupVolumeByBackupTargetAndVolumeRO(btName, volName)
 	if err != nil {
-		return errors.Wrapf(err, "failed to get the backup volume %v info", bvName)
+		return errors.Wrapf(err, "failed to get the backup volume %v of the backup target %s info", volName, btName)
 	}
 
 	volumeRecurringJobInfoStr, exist := bv.Status.Labels[types.VolumeRecurringJobInfoLabel]
@@ -3875,7 +3937,7 @@ func (c *VolumeController) restoreVolumeRecurringJobs(v *longhorn.Volume) error 
 	}
 
 	if err := json.Unmarshal([]byte(volumeRecurringJobInfoStr), &backupVolumeRecurringJobsInfo); err != nil {
-		return errors.Wrapf(err, "failed to unmarshal information of volume recurring jobs, backup volume %v", bvName)
+		return errors.Wrapf(err, "failed to unmarshal information of volume recurring jobs, backup volume %v of the backup target %s", volName, btName)
 	}
 
 	for jobName, job := range backupVolumeRecurringJobsInfo {
@@ -4022,6 +4084,18 @@ func (c *VolumeController) createAndStartMatchingReplicas(v *longhorn.Volume,
 	rs, pathToOldRs, pathToNewRs map[string]*longhorn.Replica,
 	fixupFunc func(r *longhorn.Replica, obj string), obj string) error {
 	log := getLoggerForVolume(c.logger, v)
+	if types.IsDataEngineV2(v.Spec.DataEngine) {
+		for path, r := range pathToOldRs {
+			if pathToNewRs[path] != nil {
+				continue
+			}
+			fixupFunc(r, obj)
+			rs[r.Name] = r
+			pathToNewRs[path] = r
+		}
+		return nil
+	}
+
 	for path, r := range pathToOldRs {
 		if pathToNewRs[path] != nil {
 			continue
@@ -4041,7 +4115,7 @@ func (c *VolumeController) createAndStartMatchingReplicas(v *longhorn.Volume,
 	return nil
 }
 
-func (c *VolumeController) deleteInvalidMigrationReplicas(rs, pathToOldRs, pathToNewRs map[string]*longhorn.Replica) error {
+func (c *VolumeController) deleteInvalidMigrationReplicas(rs, pathToOldRs, pathToNewRs map[string]*longhorn.Replica, v *longhorn.Volume) error {
 	for path, r := range pathToNewRs {
 		matchTheOldReplica := pathToOldRs[path] != nil && r.Spec.DesireState == pathToOldRs[path].Spec.DesireState
 		newReplicaIsAvailable := r.DeletionTimestamp == nil && r.Spec.DesireState == longhorn.InstanceStateRunning &&
@@ -4050,8 +4124,12 @@ func (c *VolumeController) deleteInvalidMigrationReplicas(rs, pathToOldRs, pathT
 			continue
 		}
 		delete(pathToNewRs, path)
-		if err := c.deleteReplica(r, rs); err != nil {
-			return errors.Wrapf(err, "failed to delete the new replica %v when there is no matching old replica in path %v", r.Name, path)
+		if types.IsDataEngineV1(v.Spec.DataEngine) {
+			if err := c.deleteReplica(r, rs); err != nil {
+				return errors.Wrapf(err, "failed to delete the new replica %v when there is no matching old replica in path %v", r.Name, path)
+			}
+		} else {
+			r.Spec.MigrationEngineName = ""
 		}
 	}
 	return nil
@@ -4135,9 +4213,16 @@ func (c *VolumeController) processMigration(v *longhorn.Volume, es map[string]*l
 		currentEngine.Spec.Active = true
 
 		// cleanupCorruptedOrStaleReplicas() will take care of old replicas
-		c.switchActiveReplicas(rs, func(r *longhorn.Replica, engineName string) bool {
-			return r.Spec.EngineName == engineName && r.Spec.HealthyAt != ""
-		}, currentEngine.Name)
+		if types.IsDataEngineV1(v.Spec.DataEngine) {
+			c.switchActiveReplicas(rs, func(r *longhorn.Replica, engineName string) bool {
+				return r.Spec.EngineName == engineName && r.Spec.HealthyAt != ""
+			}, currentEngine.Name)
+		} else {
+			for _, r := range rs {
+				r.Spec.MigrationEngineName = ""
+				r.Spec.EngineName = currentEngine.Name
+			}
+		}
 
 		// migration rollback or confirmation finished
 		v.Status.CurrentMigrationNodeID = ""
@@ -4174,13 +4259,19 @@ func (c *VolumeController) processMigration(v *longhorn.Volume, es map[string]*l
 			return
 		}
 
-		for _, r := range rs {
-			if r.Spec.EngineName == currentEngine.Name {
-				continue
+		if types.IsDataEngineV1(v.Spec.DataEngine) {
+			for _, r := range rs {
+				if r.Spec.EngineName == currentEngine.Name {
+					continue
+				}
+				if err2 := c.deleteReplica(r, rs); err2 != nil {
+					err = errors.Wrapf(err, "failed to delete the migration replica %v during the migration revert: %v", r.Name, err2)
+					return
+				}
 			}
-			if err2 := c.deleteReplica(r, rs); err2 != nil {
-				err = errors.Wrapf(err, "failed to delete the migration replica %v during the migration revert: %v", r.Name, err2)
-				return
+		} else {
+			for _, r := range rs {
+				r.Spec.MigrationEngineName = ""
 			}
 		}
 	}()
@@ -4297,6 +4388,8 @@ func (c *VolumeController) prepareReplicasAndEngineForMigration(v *longhorn.Volu
 			}
 		} else if r.Spec.EngineName == migrationEngine.Name {
 			migrationReplicas[dataPath] = r
+		} else if r.Spec.MigrationEngineName == migrationEngine.Name {
+			migrationReplicas[dataPath] = r
 		} else {
 			log.Warnf("During migration found unknown replica with engine %v, will directly remove it", r.Spec.EngineName)
 			if err := c.deleteReplica(r, rs); err != nil {
@@ -4305,12 +4398,16 @@ func (c *VolumeController) prepareReplicasAndEngineForMigration(v *longhorn.Volu
 		}
 	}
 
-	if err := c.deleteInvalidMigrationReplicas(rs, currentAvailableReplicas, migrationReplicas); err != nil {
+	if err := c.deleteInvalidMigrationReplicas(rs, currentAvailableReplicas, migrationReplicas, v); err != nil {
 		return false, false, err
 	}
 
 	if err := c.createAndStartMatchingReplicas(v, rs, currentAvailableReplicas, migrationReplicas, func(r *longhorn.Replica, engineName string) {
-		r.Spec.EngineName = engineName
+		if types.IsDataEngineV1(v.Spec.DataEngine) {
+			r.Spec.EngineName = engineName
+		} else {
+			r.Spec.MigrationEngineName = engineName
+		}
 	}, migrationEngine.Name); err != nil {
 		return false, false, err
 	}
@@ -4601,21 +4698,26 @@ func (c *VolumeController) enqueueVolumesForBackupVolume(obj interface{}) {
 
 	// Update last backup for the volume name matches backup volume name
 	var matchedVolumeName string
-	_, err := c.ds.GetVolumeRO(bv.Name)
+	canonicalBackupVolumeName := bv.Spec.VolumeName
+	backupTargetName := bv.Spec.BackupTargetName
+	_, err := c.ds.GetVolumeRO(canonicalBackupVolumeName)
 	if err == nil {
-		matchedVolumeName = bv.Name
-		key := bv.Namespace + "/" + bv.Name
+		matchedVolumeName = canonicalBackupVolumeName
+		key := bv.Namespace + "/" + canonicalBackupVolumeName
 		c.queue.Add(key)
 	}
 
 	// Update last backup for DR volumes
-	volumes, err := c.ds.ListDRVolumesWithBackupVolumeNameRO(bv.Name)
+	volumes, err := c.ds.ListDRVolumesWithBackupVolumeNameRO(canonicalBackupVolumeName)
 	if err != nil {
 		return
 	}
-	for volumeName := range volumes {
+	for volumeName, volume := range volumes {
 		if volumeName == matchedVolumeName {
 			// Skip the volume which be enqueued already
+			continue
+		}
+		if backupTargetName != volume.Spec.BackupTargetName {
 			continue
 		}
 
@@ -4748,9 +4850,9 @@ func (c *VolumeController) ReconcileBackupVolumeState(volume *longhorn.Volume) e
 		backupVolumeName = volume.Name
 	}
 
-	bv, err := c.ds.GetBackupVolumeRO(backupVolumeName)
+	bv, err := c.ds.GetBackupVolumeByBackupTargetAndVolumeRO(volume.Spec.BackupTargetName, backupVolumeName)
 	if err != nil && !apierrors.IsNotFound(err) {
-		return errors.Wrapf(err, "failed to get backup volume %s for volume %v", backupVolumeName, volume.Name)
+		return errors.Wrapf(err, "failed to get backup volume %s for backup target %v and volume %v", backupVolumeName, volume.Spec.BackupTargetName, volume.Name)
 	}
 
 	// Clean up last backup if the BackupVolume CR gone
@@ -4890,9 +4992,17 @@ func (c *VolumeController) shouldCleanUpFailedReplica(v *longhorn.Volume, r *lon
 		log.Warnf("Replica %v failed to rebuild too many times", r.Name)
 		return true
 	}
-	// TODO: Remove it once we can reuse failed replicas during v2 rebuilding
+
 	if types.IsDataEngineV2(v.Spec.DataEngine) {
-		return true
+		V2DataEngineFastReplicaRebuilding, err := c.ds.GetSettingAsBool(types.SettingNameV2DataEngineFastReplicaRebuilding)
+		if err != nil {
+			log.WithError(err).Warnf("Failed to get the setting %v, will consider it as false", types.SettingDefinitionV2DataEngineFastReplicaRebuilding)
+			V2DataEngineFastReplicaRebuilding = false
+		}
+		if !V2DataEngineFastReplicaRebuilding {
+			log.Infof("Failed replica %v should be cleaned up blindly since setting %v is not enabled", r.Name, types.SettingNameV2DataEngineFastReplicaRebuilding)
+			return true
+		}
 	}
 	// Failed too long ago to be useful during a rebuild.
 	if v.Spec.StaleReplicaTimeout > 0 &&

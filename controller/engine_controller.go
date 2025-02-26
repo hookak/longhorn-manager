@@ -482,17 +482,23 @@ func (ec *EngineController) CreateInstance(obj interface{}) (*longhorn.InstanceP
 		return nil, err
 	}
 
+	instanceManagerPod, err := ec.ds.GetPod(im.Name)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get pod for instance manager %v", im.Name)
+	}
+
+	instanceManagerStorageIP := ec.ds.GetStorageIPFromPod(instanceManagerPod)
+
 	return c.EngineInstanceCreate(&engineapi.EngineInstanceCreateRequest{
 		Engine:                           e,
 		VolumeFrontend:                   frontend,
 		EngineReplicaTimeout:             engineReplicaTimeout,
 		ReplicaFileSyncHTTPClientTimeout: fileSyncHTTPClientTimeout,
 		DataLocality:                     v.Spec.DataLocality,
-		ImIP:                             im.Status.IP,
 		EngineCLIAPIVersion:              cliAPIVersion,
 		UpgradeRequired:                  false,
-		InitiatorAddress:                 im.Status.IP,
-		TargetAddress:                    im.Status.IP,
+		InitiatorAddress:                 instanceManagerStorageIP,
+		TargetAddress:                    instanceManagerStorageIP,
 	})
 }
 
@@ -1414,12 +1420,14 @@ func checkSizeBeforeRestoration(log logrus.FieldLogger, engine *longhorn.Engine,
 }
 
 func (m *EngineMonitor) restoreBackup(engine *longhorn.Engine, rsMap map[string]*longhorn.RestoreStatus, cliAPIVersion int, engineClientProxy engineapi.EngineClientProxy) error {
-	backupTarget, err := m.ds.GetBackupTargetRO(types.DefaultBackupTargetName)
+	backupVolume, err := m.ds.GetBackupVolumeRO(engine.Spec.BackupVolume)
 	if err != nil {
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
-		return fmt.Errorf("cannot find the backup target %s", types.DefaultBackupTargetName)
+		return errors.Wrapf(err, "failed to get backup volume %v for backup restoration of engine %v", engine.Spec.BackupVolume, engine.Name)
+	}
+
+	backupTarget, err := m.ds.GetBackupTargetRO(backupVolume.Spec.BackupTargetName)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get backup target %s", backupVolume.Spec.BackupTargetName)
 	}
 
 	backupTargetClient, err := newBackupTargetClientFromDefaultEngineImage(m.ds, backupTarget)
@@ -1440,18 +1448,15 @@ func (m *EngineMonitor) restoreBackup(engine *longhorn.Engine, rsMap map[string]
 	}
 
 	mlog.Info("Restoring backup")
+	lastRestoredBackup := ""
+	restoreErrorHandler := handleRestoreError
 	if cliAPIVersion < engineapi.CLIVersionFour {
-		// For compatible engines, `LastRestoredBackup` is required to indicate if the restore is incremental restore
-		if err = engineClientProxy.BackupRestore(engine, backupTargetClient.URL, engine.Spec.RequestedBackupRestore, engine.Spec.BackupVolume, engine.Status.LastRestoredBackup, backupTargetClient.Credential, int(concurrentLimit)); err != nil {
-			if extraErr := handleRestoreErrorForCompatibleEngine(mlog, engine, rsMap, m.restoreBackoff, err); extraErr != nil {
-				return extraErr
-			}
-		}
-	} else {
-		if err = engineClientProxy.BackupRestore(engine, backupTargetClient.URL, engine.Spec.RequestedBackupRestore, engine.Spec.BackupVolume, "", backupTargetClient.Credential, int(concurrentLimit)); err != nil {
-			if extraErr := handleRestoreError(mlog, engine, rsMap, m.restoreBackoff, err); extraErr != nil {
-				return extraErr
-			}
+		lastRestoredBackup = engine.Status.LastRestoredBackup
+		restoreErrorHandler = handleRestoreErrorForCompatibleEngine
+	}
+	if err = engineClientProxy.BackupRestore(engine, backupTargetClient.URL, engine.Spec.RequestedBackupRestore, backupVolume.Spec.VolumeName, lastRestoredBackup, backupTargetClient.Credential, int(concurrentLimit)); err != nil {
+		if extraErr := restoreErrorHandler(mlog, engine, rsMap, m.restoreBackoff, err); extraErr != nil {
+			return extraErr
 		}
 	}
 	if err == nil {
@@ -1656,7 +1661,7 @@ func (ec *EngineController) removeUnknownReplica(e *longhorn.Engine) error {
 			defer engineClientProxy.Close()
 
 			ec.eventRecorder.Eventf(e, corev1.EventTypeNormal, constant.EventReasonDelete, "Removing unknown replica %v in mode %v from engine", url, unknownReplicaMap[url])
-			if err := engineClientProxy.ReplicaRemove(e, url); err != nil {
+			if err := engineClientProxy.ReplicaRemove(e, url, ""); err != nil {
 				ec.eventRecorder.Eventf(e, corev1.EventTypeWarning, constant.EventReasonFailedDeleting, "Failed to remove unknown replica %v in mode %v from engine: %v", url, unknownReplicaMap[url], err)
 			} else {
 				ec.eventRecorder.Eventf(e, corev1.EventTypeNormal, constant.EventReasonDelete, "Removed unknown replica %v in mode %v from engine", url, unknownReplicaMap[url])
@@ -1859,7 +1864,7 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replicaName, add
 			// the replica to failed.
 			// user can decide to delete it then we will try again
 			log.Infof("Removing failed rebuilding replica %v", addr)
-			if err := engineClientProxy.ReplicaRemove(e, replicaURL); err != nil {
+			if err := engineClientProxy.ReplicaRemove(e, replicaURL, replicaName); err != nil {
 				log.WithError(err).Warnf("Failed to remove rebuilding replica %v", addr)
 				ec.eventRecorder.Eventf(e, corev1.EventTypeWarning, constant.EventReasonFailedDeleting,
 					"Failed to remove rebuilding replica %v with address %v for engine %v and volume %v due to rebuilding failure: %v",

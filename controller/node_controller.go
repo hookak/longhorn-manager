@@ -10,7 +10,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rancher/lasso/pkg/log"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -25,13 +24,6 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientset "k8s.io/client-go/kubernetes"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-
-	iscsiutil "github.com/longhorn/go-iscsi-helper/util"
-
-	lhexec "github.com/longhorn/go-common-libs/exec"
-	lhio "github.com/longhorn/go-common-libs/io"
-	lhns "github.com/longhorn/go-common-libs/ns"
-	lhtypes "github.com/longhorn/go-common-libs/types"
 
 	"github.com/longhorn/longhorn-manager/constant"
 	"github.com/longhorn/longhorn-manager/datastore"
@@ -51,15 +43,7 @@ const (
 
 	unknownDiskID = "UNKNOWN_DISKID"
 
-	kernelConfigFilePathPrefix = "/host/boot/config-"
-	kernelConfigGzFilePath     = "/proc/config.gz"
-
 	snapshotChangeEventQueueMax = 1048576
-)
-
-var (
-	kernelModules     = map[string]string{"CONFIG_DM_CRYPT": "dm_crypt"}
-	nfsClientVersions = map[string]string{"CONFIG_NFS_V4_2": "nfs", "CONFIG_NFS_V4_1": "nfs", "CONFIG_NFS_V4": "nfs"}
 )
 
 type NodeController struct {
@@ -72,7 +56,8 @@ type NodeController struct {
 	kubeClient    clientset.Interface
 	eventRecorder record.EventRecorder
 
-	diskMonitor monitor.Monitor
+	diskMonitor             monitor.Monitor
+	environmentCheckMonitor monitor.Monitor
 
 	snapshotMonitor              monitor.Monitor
 	snapshotChangeEventQueue     workqueue.TypedInterface[any]
@@ -432,6 +417,13 @@ func (nc *NodeController) syncNode(key string) (err error) {
 		return err
 	}
 
+	// Set any RWX leases to non-delinquent if owned by not-ready node.
+	// Usefulness of delinquent state has passed.
+	if err = nc.clearDelinquentLeasesIfNodeNotReady(node); err != nil {
+		log.WithError(err).Warnf("Failed to clear delinquent leases for node %v", node.Name)
+		return err
+	}
+
 	node.Status.Region, node.Status.Zone = types.GetRegionAndZone(kubeNode.Labels)
 
 	if nc.controllerID != node.Name {
@@ -451,10 +443,15 @@ func (nc *NodeController) syncNode(key string) (err error) {
 		return err
 	}
 
+	// Create a monitor for collecting environment check information
+	if _, err := nc.createEnvironmentCheckMonitor(); err != nil {
+		return err
+	}
+
 	collectedDiskInfo, err := nc.syncWithDiskMonitor(node)
 	if err != nil {
 		if strings.Contains(err.Error(), "mismatching disks") {
-			log.WithError(err).Info("Failed to sync with disk monitor due to mismatching disks")
+			log.WithError(err).Warn("Failed to sync with disk monitor due to mismatching disks")
 			return nil
 		}
 		return err
@@ -463,6 +460,12 @@ func (nc *NodeController) syncNode(key string) (err error) {
 	// sync disks status on current node
 	if err := nc.syncDiskStatus(node, collectedDiskInfo); err != nil {
 		return err
+	}
+
+	collectedEnvironmentCheckConditions, err := nc.syncWithEnvironmentCheckMonitor()
+	if err == nil {
+		// Best effort to update the environment check conditions
+		nc.syncEnvironmentCheckConditions(node, collectedEnvironmentCheckConditions)
 	}
 
 	_, err = nc.createSnapshotMonitor()
@@ -488,9 +491,6 @@ func (nc *NodeController) syncNode(key string) (err error) {
 			}
 		}
 	}
-
-	// check if environment settings meet the requirements on current node
-	nc.environmentCheck(kubeNode, node)
 
 	if err := nc.syncInstanceManagers(node); err != nil {
 		return err
@@ -674,6 +674,35 @@ func (nc *NodeController) syncDiskStatus(node *longhorn.Node, collectedDataInfo 
 	return nc.updateDiskStatusSchedulableCondition(node)
 }
 
+func (nc *NodeController) syncEnvironmentCheckConditions(node *longhorn.Node, conditions []longhorn.Condition) {
+	// Add condition to node.status.conditions if it is not already there
+	// Update the condition status and reason if it is already in the node.status.conditions
+	for _, condition := range conditions {
+		found := false
+		for _, existingCondition := range node.Status.Conditions {
+			if existingCondition.Type == condition.Type {
+				node.Status.Conditions = types.SetCondition(node.Status.Conditions, condition.Type, condition.Status, condition.Reason, condition.Message)
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Add condition to node.status.conditions if it is not already there
+			node.Status.Conditions = append(node.Status.Conditions, condition)
+		}
+	}
+
+	isV2DataEngine, err := nc.ds.GetSettingAsBool(types.SettingNameV2DataEngine)
+	if err != nil {
+		nc.logger.WithError(err).Debug("Failed to fetch v2-data-engine setting")
+		isV2DataEngine = false
+	}
+
+	if !isV2DataEngine {
+		node.Status.Conditions = types.RemoveCondition(node.Status.Conditions, longhorn.NodeConditionTypeHugePagesAvailable)
+	}
+}
+
 func (nc *NodeController) findNotReadyAndReadyDiskMaps(node *longhorn.Node, collectedDataInfo map[string]*monitor.CollectedDiskInfo) (notReadyDiskInfoMap, readyDiskInfoMap map[string]map[string]*monitor.CollectedDiskInfo) {
 	notReadyDiskInfoMap = make(map[string]map[string]*monitor.CollectedDiskInfo, 0)
 	readyDiskInfoMap = make(map[string]map[string]*monitor.CollectedDiskInfo, 0)
@@ -781,10 +810,13 @@ func (nc *NodeController) updateReadyDiskStatusReadyCondition(node *longhorn.Nod
 		diskStatus := diskStatusMap[diskName]
 
 		if diskStatus.DiskUUID == info.DiskUUID {
-			// on the default disks this will be updated constantly since there is always something generating new disk usage (logs, etc)
-			// We also don't need byte/block precisions for this instead we can round down to the next 10/100mb
-			const truncateTo = 100 * 1024 * 1024
-			usableStorage := (diskInfoMap[diskName].DiskStat.StorageAvailable / truncateTo) * truncateTo
+			usableStorage := diskInfoMap[diskName].DiskStat.StorageAvailable
+			if diskStatus.Type == longhorn.DiskTypeFilesystem {
+				// on the default disks this will be updated constantly since there is always something generating new disk usage (logs, etc)
+				// We also don't need byte/block precisions for this instead we can round down to the next 10/100mb
+				const truncateTo = 100 * 1024 * 1024
+				usableStorage = (diskInfoMap[diskName].DiskStat.StorageAvailable / truncateTo) * truncateTo
+			}
 			diskStatus.StorageAvailable = usableStorage
 			diskStatus.StorageMaximum = diskInfoMap[diskName].DiskStat.StorageMaximum
 			diskStatus.InstanceManagerName = diskInfoMap[diskName].InstanceManagerName
@@ -941,352 +973,6 @@ func (nc *NodeController) syncNodeStatus(pod *corev1.Pod, node *longhorn.Node) e
 	}
 
 	return nil
-}
-
-func (nc *NodeController) environmentCheck(kubeNode *corev1.Node, node *longhorn.Node) {
-	// Need to find the better way to check if various kernel versions are supported
-	namespaces := []lhtypes.Namespace{lhtypes.NamespaceMnt, lhtypes.NamespaceNet}
-	nc.syncPackagesInstalled(kubeNode, node, namespaces)
-	nc.syncMultipathd(node, namespaces)
-	nc.checkKernelModulesLoaded(kubeNode, node, namespaces)
-	nc.syncNFSClientVersion(kubeNode, node, namespaces)
-}
-
-func (nc *NodeController) syncPackagesInstalled(kubeNode *corev1.Node, node *longhorn.Node, namespaces []lhtypes.Namespace) {
-	osImage := strings.ToLower(kubeNode.Status.NodeInfo.OSImage)
-	queryPackagesCmd := ""
-	options := []string{}
-	packages := []string{}
-	pipeFlag := false
-
-	switch {
-	case strings.Contains(osImage, "talos"):
-		nc.syncPackagesInstalledTalosLinux(node, namespaces)
-		return
-	case strings.Contains(osImage, "ubuntu"):
-		fallthrough
-	case strings.Contains(osImage, "debian"):
-		queryPackagesCmd = "dpkg"
-		options = append(options, "-l")
-		packages = append(packages, "nfs-common", "open-iscsi", "cryptsetup", "dmsetup")
-		pipeFlag = true
-	case strings.Contains(osImage, "centos"):
-		fallthrough
-	case strings.Contains(osImage, "fedora"):
-		fallthrough
-	case strings.Contains(osImage, "rocky"):
-		fallthrough
-	case strings.Contains(osImage, "ol"):
-		queryPackagesCmd = "rpm"
-		options = append(options, "-q")
-		packages = append(packages, "nfs-utils", "iscsi-initiator-utils", "cryptsetup", "device-mapper")
-	case strings.Contains(osImage, "suse"):
-		queryPackagesCmd = "rpm"
-		options = append(options, "-q")
-		packages = append(packages, "nfs-client", "open-iscsi", "cryptsetup", "device-mapper")
-	case strings.Contains(osImage, "arch"):
-		queryPackagesCmd = "pacman"
-		options = append(options, "-Q")
-		packages = append(packages, "nfs-utils", "open-iscsi", "cryptsetup", "device-mapper")
-	case strings.Contains(osImage, "gentoo"):
-		queryPackagesCmd = "qlist"
-		options = append(options, "-I")
-		packages = append(packages, "net-fs/nfs-utils", "sys-block/open-iscsi", "sys-fs/cryptsetup", "sys-fs/lvm2")
-	default:
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonUnknownOS),
-			fmt.Sprintf("Unable to verify the required packages because the OS image '%v' is unknown to the Longhorn system. Please ensure the required packages are installed.", osImage))
-		return
-	}
-
-	nsexec, err := lhns.NewNamespaceExecutor(lhtypes.ProcessNone, lhtypes.HostProcDirectory, namespaces)
-	if err != nil {
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonNamespaceExecutorErr),
-			fmt.Sprintf("Failed to get namespace executor: %v", err.Error()))
-		return
-	}
-
-	notFoundPkgs := []string{}
-	for _, pkg := range packages {
-		args := options
-		if !pipeFlag {
-			args = append(args, pkg)
-		}
-		queryResult, err := nsexec.Execute(nil, queryPackagesCmd, args, lhtypes.ExecuteDefaultTimeout)
-		if err != nil {
-			nc.logger.WithError(err).Debugf("Package %v is not found in node %v", pkg, node.Name)
-			notFoundPkgs = append(notFoundPkgs, pkg)
-			continue
-		}
-		if pipeFlag {
-			if _, err := lhexec.NewExecutor().ExecuteWithStdinPipe("grep", []string{"-w", pkg}, queryResult, lhtypes.ExecuteDefaultTimeout); err != nil {
-				nc.logger.WithError(err).Debugf("Package %v is not found in node %v", pkg, node.Name)
-				notFoundPkgs = append(notFoundPkgs, pkg)
-				continue
-			}
-		}
-	}
-
-	if len(notFoundPkgs) > 0 {
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonPackagesNotInstalled),
-			fmt.Sprintf("Missing packages: %v", notFoundPkgs))
-		return
-	}
-
-	node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusTrue, "",
-		fmt.Sprintf("All required packages %v are installed on node %v", packages, node.Name))
-}
-
-func (nc *NodeController) syncPackagesInstalledTalosLinux(node *longhorn.Node, namespaces []lhtypes.Namespace) {
-	type validateCommand struct {
-		binary string
-		args   []string
-	}
-
-	packagesIsInstalled := map[string]bool{}
-
-	// Helper function to validate packages within a namespace and update node
-	// status if there is an error.
-	validatePackages := func(process string, binaryToValidateCommand map[string]validateCommand) (ok bool) {
-		nsexec, err := lhns.NewNamespaceExecutor(process, lhtypes.HostProcDirectory, namespaces)
-		if err != nil {
-			node.Status.Conditions = types.SetCondition(
-				node.Status.Conditions, longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse,
-				string(longhorn.NodeConditionReasonNamespaceExecutorErr), fmt.Sprintf("Failed to get namespace executor: %v", err.Error()),
-			)
-			return false
-		}
-
-		for binary, command := range binaryToValidateCommand {
-			_, err := nsexec.Execute(nil, command.binary, command.args, lhtypes.ExecuteDefaultTimeout)
-			if err != nil {
-				nc.logger.WithError(err).Debugf("Package %v is not found in node %v", binary, node.Name)
-				packagesIsInstalled[binary] = false
-			} else {
-				packagesIsInstalled[binary] = true
-			}
-		}
-		return true
-	}
-
-	// The validation commands by process.
-	hostPackageToValidateCmd := map[string]validateCommand{
-		"cryptsetup": {binary: "cryptsetup", args: []string{"--version"}},
-		"dmsetup":    {binary: "dmsetup", args: []string{"--version"}},
-	}
-	kubeletPackageToValidateCmd := map[string]validateCommand{
-		"nfs-common": {binary: "dpkg", args: []string{"-s", "nfs-common"}},
-	}
-	iscsiPackageToValidateCmd := map[string]validateCommand{
-		"iscsiadm": {binary: "iscsiadm", args: []string{"--version"}},
-	}
-
-	// Check each set of packagesl return immediately if there is an error.
-	if !validatePackages(lhtypes.ProcessNone, hostPackageToValidateCmd) ||
-		!validatePackages(lhns.GetDefaultProcessName(), kubeletPackageToValidateCmd) ||
-		!validatePackages(iscsiutil.ISCSIdProcess, iscsiPackageToValidateCmd) {
-		return
-	}
-
-	// Organize the installed and not installed packages.
-	installedPackages := []string{}
-	notInstalledPackages := []string{}
-	for binary, isInstalled := range packagesIsInstalled {
-		if isInstalled {
-			installedPackages = append(installedPackages, binary)
-		} else {
-			notInstalledPackages = append(notInstalledPackages, binary)
-		}
-	}
-
-	// Update node condition based on  packages installed status.
-	if len(notInstalledPackages) > 0 {
-		node.Status.Conditions = types.SetCondition(
-			node.Status.Conditions, longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonPackagesNotInstalled), fmt.Sprintf("Missing packages: %v", notInstalledPackages),
-		)
-	} else {
-		node.Status.Conditions = types.SetCondition(
-			node.Status.Conditions, longhorn.NodeConditionTypeRequiredPackages, longhorn.ConditionStatusTrue,
-			"", fmt.Sprintf("All required packages %v are installed on node %v", installedPackages, node.Name),
-		)
-	}
-}
-
-func (nc *NodeController) syncMultipathd(node *longhorn.Node, namespaces []lhtypes.Namespace) {
-	nsexec, err := lhns.NewNamespaceExecutor(lhtypes.ProcessNone, lhtypes.HostProcDirectory, namespaces)
-	if err != nil {
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonNamespaceExecutorErr),
-			fmt.Sprintf("Failed to get namespace executor: %v", err.Error()))
-		return
-	}
-	args := []string{"show", "status"}
-	if result, _ := nsexec.Execute(nil, "multipathd", args, lhtypes.ExecuteDefaultTimeout); result != "" {
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonMultipathdIsRunning),
-			"multipathd is running with a known issue that affects Longhorn. See description and solution at https://longhorn.io/kb/troubleshooting-volume-with-multipath")
-		return
-	}
-
-	node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeMultipathd, longhorn.ConditionStatusTrue, "", "")
-}
-
-func (nc *NodeController) checkKernelModulesLoaded(kubeNode *corev1.Node, node *longhorn.Node, namespaces []lhtypes.Namespace) {
-	notFoundModulesUsingkmod, err := checkModulesLoadedUsingkmod(kernelModules)
-	if err != nil {
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonNamespaceExecutorErr),
-			fmt.Sprintf("Failed to check kernel modules: %v", err.Error()))
-		return
-	}
-
-	if len(notFoundModulesUsingkmod) == 0 {
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusTrue, "",
-			fmt.Sprintf("Kernel modules %v are loaded on node %v", getModulesConfigsList(kernelModules, false), node.Name))
-		return
-	}
-
-	notLoadedModules, err := checkModulesLoadedByConfigFile(nc.logger, notFoundModulesUsingkmod, kubeNode.Status.NodeInfo.KernelVersion, namespaces)
-	if err != nil {
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonCheckKernelConfigFailed),
-			fmt.Sprintf("Failed to check kernel config file for kernel modules %v: %v", notFoundModulesUsingkmod, err.Error()))
-		return
-	}
-
-	if len(notLoadedModules) != 0 {
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonKernelModulesNotLoaded),
-			fmt.Sprintf("Kernel modules %v are not loaded on node %v", notLoadedModules, node.Name))
-		return
-	}
-
-	node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeKernelModulesLoaded, longhorn.ConditionStatusTrue, "",
-		fmt.Sprintf("Kernel modules %v are loaded on node %v", getModulesConfigsList(kernelModules, false), node.Name))
-}
-
-func checkModulesLoadedUsingkmod(modules map[string]string) (map[string]string, error) {
-	kmodResult, err := lhexec.NewExecutor().Execute(nil, "kmod", []string{"list"}, lhtypes.ExecuteDefaultTimeout)
-	if err != nil {
-		return nil, err
-	}
-
-	notFoundModules := map[string]string{}
-	for config, module := range modules {
-		if !strings.Contains(kmodResult, module) {
-			notFoundModules[config] = module
-		}
-	}
-
-	return notFoundModules, nil
-}
-
-func checkModulesLoadedByConfigFile(log *logrus.Entry, modules map[string]string, kernelVersion string, namespaces []lhtypes.Namespace) ([]string, error) {
-	kernelConfigPath := kernelConfigFilePathPrefix + kernelVersion
-	kernelConfigContent, err := lhio.ReadFileContent(kernelConfigPath)
-	if err != nil {
-		if !errors.Is(err, unix.ENOENT) {
-			return nil, err
-		}
-
-		// If the kernel config file is not found, try to get it from the host proc directory
-		nsexec, err := lhns.NewNamespaceExecutor(lhns.GetDefaultProcessName(), lhtypes.HostProcDirectory, namespaces)
-		if err != nil {
-			return nil, err
-		}
-
-		kernelConfigContent, err = nsexec.Execute(nil, "zcat", []string{kernelConfigGzFilePath}, lhtypes.ExecuteDefaultTimeout)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	kernelConfigMap := getKernelModuleConfigMap(kernelConfigContent)
-
-	notLoadedModules := []string{}
-	for config, module := range modules {
-		moduleEnabled, err := checkKernelModuleEnabled(log, kernelConfigContent, config, module, kernelConfigMap)
-		if err != nil {
-			return nil, err
-		}
-		if !moduleEnabled {
-			notLoadedModules = append(notLoadedModules, module)
-		}
-	}
-
-	return notLoadedModules, nil
-}
-
-func getKernelModuleConfigMap(kernelConfigContent string) map[string]string {
-	configMap := map[string]string{}
-	configs := strings.Split(kernelConfigContent, "\n")
-	for _, config := range configs {
-		if !strings.HasPrefix(config, "CONFIG_") {
-			continue
-		}
-		configSplits := strings.Split(config, "=")
-		configMap[strings.TrimSpace(configSplits[0])] = strings.TrimSpace(configSplits[1])
-	}
-	return configMap
-}
-
-func checkKernelModuleEnabled(log *logrus.Entry, kernelConfigContent, module, kmodName string, kernelConfigMap map[string]string) (bool, error) {
-	enabled, exists := kernelConfigMap[module]
-	if !exists {
-		log.Debugf("Kernel config value for %v is not found", module)
-		return false, nil
-	}
-
-	switch enabled {
-	case "y":
-		return true, nil
-	case "m":
-		kmodResult, err := lhexec.NewExecutor().Execute(nil, "kmod", []string{"list"}, lhtypes.ExecuteDefaultTimeout)
-		if err != nil {
-			return false, errors.Wrap(err, "Failed to execute command `kmod`")
-		}
-		if strings.Contains(kmodResult, kmodName) {
-			return true, nil
-		}
-	default:
-		log.Debugf("Unknown kernel config value for %v: %v", module, enabled)
-	}
-
-	return false, nil
-}
-
-func getModulesConfigsList(modulesMap map[string]string, needModules bool) []string {
-	modulesConfigs := []string{}
-	for mod, config := range modulesMap {
-		appendingObj := config
-		if needModules {
-			appendingObj = mod
-		}
-		modulesConfigs = append(modulesConfigs, appendingObj)
-	}
-	return modulesConfigs
-}
-
-func (nc *NodeController) syncNFSClientVersion(kubeNode *corev1.Node, node *longhorn.Node, namespaces []lhtypes.Namespace) {
-	notLoadedModules, err := checkModulesLoadedByConfigFile(nc.logger, nfsClientVersions, kubeNode.Status.NodeInfo.KernelVersion, namespaces)
-	if err != nil {
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonCheckKernelConfigFailed),
-			fmt.Sprintf("Failed to check kernel config file for kernel modules %v: %v", nfsClientVersions, err.Error()))
-		return
-	}
-
-	if len(notLoadedModules) == len(nfsClientVersions) {
-		node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusFalse,
-			string(longhorn.NodeConditionReasonNFSClientIsNotFound),
-			fmt.Sprintf("NFS clients %v not found. At least one should be enabled", getModulesConfigsList(nfsClientVersions, true)))
-		return
-	}
-
-	node.Status.Conditions = types.SetCondition(node.Status.Conditions, longhorn.NodeConditionTypeNFSClientInstalled, longhorn.ConditionStatusTrue, "", "")
 }
 
 func (nc *NodeController) getImTypeDataEngines(node *longhorn.Node) map[longhorn.InstanceManagerType][]longhorn.DataEngineType {
@@ -1606,6 +1292,21 @@ func (nc *NodeController) createDiskMonitor() (monitor.Monitor, error) {
 	return monitor, nil
 }
 
+func (nc *NodeController) createEnvironmentCheckMonitor() (monitor.Monitor, error) {
+	if nc.environmentCheckMonitor != nil {
+		return nc.environmentCheckMonitor, nil
+	}
+
+	monitor, err := monitor.NewEnvironmentCheckMonitor(nc.logger, nc.ds, nc.controllerID, nc.enqueueNodeForMonitor)
+	if err != nil {
+		return nil, err
+	}
+
+	nc.environmentCheckMonitor = monitor
+
+	return monitor, nil
+}
+
 func (nc *NodeController) enqueueNodeForMonitor(key string) {
 	nc.queue.Add(key)
 }
@@ -1754,6 +1455,20 @@ func (nc *NodeController) syncWithDiskMonitor(node *longhorn.Node) (map[string]*
 	}
 
 	return collectedDiskInfo, nil
+}
+
+func (nc *NodeController) syncWithEnvironmentCheckMonitor() ([]longhorn.Condition, error) {
+	v, err := nc.environmentCheckMonitor.GetCollectedData()
+	if err != nil {
+		return []longhorn.Condition{}, err
+	}
+
+	conditions, ok := v.([]longhorn.Condition)
+	if !ok {
+		return []longhorn.Condition{}, errors.New("failed to convert the collected data to conditions")
+	}
+
+	return conditions, nil
 }
 
 // Check all disks in the same filesystem ID are in ready status
@@ -1922,7 +1637,7 @@ func (nc *NodeController) syncBackingImageEvictionRequested(node *longhorn.Node)
 			}
 		} else {
 			for _, backingImage := range diskBackingImageMap[diskUUID] {
-				if backingImage.Spec.DiskFileSpecMap[diskUUID].EvictionRequested {
+				if diskFileSpec, ok := backingImage.Spec.DiskFileSpecMap[diskUUID]; ok && diskFileSpec.EvictionRequested {
 					// if it is previously set to true, cancel the eviction request
 					backingImage.Spec.DiskFileSpecMap[diskUUID].EvictionRequested = false
 					backingImagesToSync = append(backingImagesToSync, backingImageToSync{backingImage, diskUUID, false})
@@ -2192,4 +1907,41 @@ func (nc *NodeController) SetSchedulableCondition(node *longhorn.Node, kubeNode 
 				nc.eventRecorder, node,
 				corev1.EventTypeNormal)
 	}
+}
+
+func (nc *NodeController) clearDelinquentLeasesIfNodeNotReady(node *longhorn.Node) error {
+	enabled, err := nc.ds.GetSettingAsBool(types.SettingNameRWXVolumeFastFailover)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get setting %v", types.SettingNameRWXVolumeFastFailover)
+	}
+	if !enabled {
+		return nil
+	}
+
+	isDownOrDeleted, err := nc.ds.IsNodeDownOrDeleted(node.Name)
+	if err != nil {
+		return errors.Wrapf(err, "failed to check IsNodeDownOrDeleted, node=%v", node.Name)
+	}
+	if !isDownOrDeleted {
+		return nil
+	}
+
+	sms, err := nc.ds.ListShareManagersRO()
+	if err != nil {
+		return errors.Wrap(err, "failed to list share managers")
+	}
+	var storedError error
+	for _, sm := range sms {
+		// It's tempting to filter by sm.Status.OwnerID here, but don't.  It's already been modified to a new node to handle the fast failover.
+		// Anyway, we just need its name.  Share manager name is volume name is lease name.
+		err = nc.ds.ClearDelinquentAndStaleStateIfVolumeIsDelinquent(sm.Name, node.Name)
+		if err != nil {
+			nc.logger.WithError(err).Warnf("failed to clear delinquent lease for volume %v, node %v", sm.Name, node.Name)
+			if storedError == nil {
+				storedError = errors.Wrapf(err, "failed to clear delinquent lease for volume %v, node %v", sm.Name, node.Name)
+			}
+		}
+	}
+
+	return storedError
 }

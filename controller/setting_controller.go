@@ -53,7 +53,6 @@ const (
 var (
 	upgradeCheckInterval          = time.Hour
 	settingControllerResyncPeriod = time.Hour
-	checkUpgradeURL               = "https://longhorn-upgrade-responder.rancher.io/v1/checkupgrade"
 )
 
 type SettingController struct {
@@ -73,19 +72,6 @@ type SettingController struct {
 	// upgrade checker
 	lastUpgradeCheckedTimestamp time.Time
 	version                     string
-
-	// backup store timer is responsible for updating the backupTarget.spec.syncRequestAt
-	bsTimer *BackupStoreTimer
-}
-
-type BackupStoreTimer struct {
-	logger       logrus.FieldLogger
-	controllerID string
-	ds           *datastore.DataStore
-
-	pollInterval time.Duration
-	ctx          context.Context
-	cancel       context.CancelFunc
 }
 
 type Version struct {
@@ -154,13 +140,6 @@ func NewSettingController(
 		return nil, err
 	}
 	sc.cacheSyncs = append(sc.cacheSyncs, ds.NodeInformer.HasSynced)
-
-	if _, err = ds.BackupTargetInformer.AddEventHandlerWithResyncPeriod(cache.ResourceEventHandlerFuncs{
-		DeleteFunc: sc.enqueueSettingForBackupTarget,
-	}, 0); err != nil {
-		return nil, err
-	}
-	sc.cacheSyncs = append(sc.cacheSyncs, ds.BackupTargetInformer.HasSynced)
 
 	return sc, nil
 }
@@ -261,10 +240,6 @@ func (sc *SettingController) syncNonDangerZoneSettingsForManagedComponents(setti
 		if err := sc.syncUpgradeChecker(); err != nil {
 			return err
 		}
-	case types.SettingNameBackupTarget, types.SettingNameBackupTargetCredentialSecret, types.SettingNameBackupstorePollInterval:
-		if err := sc.syncBackupTarget(); err != nil {
-			return err
-		}
 	case types.SettingNameKubernetesClusterAutoscalerEnabled:
 		if err := sc.updateKubernetesClusterAutoscalerEnabled(); err != nil {
 			return err
@@ -324,7 +299,7 @@ func (sc *SettingController) syncDangerZoneSettingsForManagedComponents(settingN
 			}
 		case types.SettingNameStorageNetwork:
 			funcPreupdate := func() error {
-				detached, _, err := sc.ds.AreAllVolumesDetached(longhorn.DataEngineTypeAll)
+				detached, err := sc.ds.AreAllVolumesDetachedState()
 				if err != nil {
 					return errors.Wrapf(err, "failed to check volume detachment for %v setting update", types.SettingNameStorageNetwork)
 				}
@@ -421,202 +396,6 @@ func getResponsibleNodeID(ds *datastore.DataStore) (string, error) {
 	return responsibleNodes[0], nil
 }
 
-func (sc *SettingController) syncBackupTarget() (err error) {
-	defer func() {
-		err = errors.Wrap(err, "failed to sync backup target")
-	}()
-
-	stopTimer := func() {
-		if sc.bsTimer != nil {
-			sc.bsTimer.Stop()
-			sc.bsTimer = nil
-		}
-	}
-
-	responsibleNodeID, err := getResponsibleNodeID(sc.ds)
-	if err != nil {
-		return errors.Wrap(err, "failed to select node for sync backup target")
-	}
-	if responsibleNodeID != sc.controllerID {
-		stopTimer()
-		return nil
-	}
-
-	// Get settings
-	targetSetting, err := sc.ds.GetSettingWithAutoFillingRO(types.SettingNameBackupTarget)
-	if err != nil {
-		return err
-	}
-
-	secretSetting, err := sc.ds.GetSettingWithAutoFillingRO(types.SettingNameBackupTargetCredentialSecret)
-	if err != nil {
-		return err
-	}
-
-	interval, err := sc.ds.GetSettingAsInt(types.SettingNameBackupstorePollInterval)
-	if err != nil {
-		return err
-	}
-	pollInterval := time.Duration(interval) * time.Second
-
-	backupTarget, err := sc.ds.GetBackupTarget(types.DefaultBackupTargetName)
-	if err != nil {
-		if !datastore.ErrorIsNotFound(err) {
-			return err
-		}
-
-		// Create the default BackupTarget CR if not present
-		backupTarget, err = sc.ds.CreateBackupTarget(&longhorn.BackupTarget{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: types.DefaultBackupTargetName,
-			},
-			Spec: longhorn.BackupTargetSpec{
-				BackupTargetURL:  targetSetting.Value,
-				CredentialSecret: secretSetting.Value,
-				PollInterval:     metav1.Duration{Duration: pollInterval},
-			},
-		})
-		if err != nil {
-			return errors.Wrap(err, "failed to create backup target")
-		}
-	}
-
-	existingBackupTarget := backupTarget.DeepCopy()
-	defer func() {
-		backupTarget.Spec.BackupTargetURL = targetSetting.Value
-		backupTarget.Spec.CredentialSecret = secretSetting.Value
-		backupTarget.Spec.PollInterval = metav1.Duration{Duration: pollInterval}
-		if !reflect.DeepEqual(existingBackupTarget.Spec, backupTarget.Spec) {
-			// Force sync backup target once the BackupTarget spec be updated
-			backupTarget.Spec.SyncRequestedAt = metav1.Time{Time: time.Now().UTC()}
-			if _, err = sc.ds.UpdateBackupTarget(backupTarget); err != nil && !apierrors.IsConflict(errors.Cause(err)) {
-				sc.logger.WithError(err).Warn("Failed to update backup target")
-			}
-			if err = sc.handleSecretsForAWSIAMRoleAnnotation(backupTarget.Spec.BackupTargetURL, existingBackupTarget.Spec.CredentialSecret, secretSetting.Value, existingBackupTarget.Spec.BackupTargetURL != targetSetting.Value); err != nil {
-				sc.logger.WithError(err).Warn("Failed to update secrets for AWSIAMRoleAnnotation")
-			}
-		}
-	}()
-
-	noNeedMonitor := targetSetting.Value == "" || pollInterval == time.Duration(0)
-	if noNeedMonitor {
-		stopTimer()
-		return nil
-	}
-
-	if sc.bsTimer != nil {
-		if sc.bsTimer.pollInterval == pollInterval {
-			// No need to start a new timer if there was one
-			return
-		}
-		// Stop the timer if the poll interval changes
-		stopTimer()
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	// Start backup store timer
-	sc.bsTimer = &BackupStoreTimer{
-		logger:       sc.logger.WithField("component", "backup-store-timer"),
-		controllerID: sc.controllerID,
-		ds:           sc.ds,
-
-		pollInterval: pollInterval,
-		ctx:          ctx,
-		cancel:       cancel,
-	}
-	go sc.bsTimer.Start()
-	return nil
-}
-
-func (sc *SettingController) handleSecretsForAWSIAMRoleAnnotation(backupTargetURL, oldSecretName, newSecretName string, isBackupTargetURLChanged bool) (err error) {
-	isSameSecretName := oldSecretName == newSecretName
-	if isSameSecretName && !isBackupTargetURLChanged {
-		return nil
-	}
-
-	isArnExists := false
-	if !isSameSecretName {
-		isArnExists, _, err = sc.updateSecretForAWSIAMRoleAnnotation(backupTargetURL, oldSecretName, true)
-		if err != nil {
-			return err
-		}
-	}
-	_, isValidSecret, err := sc.updateSecretForAWSIAMRoleAnnotation(backupTargetURL, newSecretName, false)
-	if err != nil {
-		return err
-	}
-	// kubernetes_secret_controller will not reconcile the secret that does not exist such as named "", so we remove AWS IAM role annotation of pods if new secret name is "".
-	if !isValidSecret && isArnExists {
-		if err = sc.removePodsAWSIAMRoleAnnotation(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// updateSecretForAWSIAMRoleAnnotation adds the AWS IAM Role annotation to make an update to reconcile in kubernetes secret controller and returns
-//
-//	isArnExists = true if annotation had been added to the secret for first parameter,
-//	isValidSecret = true if this secret is valid for second parameter.
-//	err != nil if there is an error occurred.
-func (sc *SettingController) updateSecretForAWSIAMRoleAnnotation(backupTargetURL, secretName string, isOldSecret bool) (isArnExists bool, isValidSecret bool, err error) {
-	if secretName == "" {
-		return false, false, nil
-	}
-
-	secret, err := sc.ds.GetSecret(sc.namespace, secretName)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, false, nil
-		}
-		return false, false, err
-	}
-
-	if isOldSecret {
-		delete(secret.Annotations, types.GetLonghornLabelKey(string(types.SettingNameBackupTarget)))
-		isArnExists = secret.Data[types.AWSIAMRoleArn] != nil
-	} else {
-		if secret.Annotations == nil {
-			secret.Annotations = make(map[string]string)
-		}
-		secret.Annotations[types.GetLonghornLabelKey(string(types.SettingNameBackupTarget))] = backupTargetURL
-	}
-
-	if _, err = sc.ds.UpdateSecret(sc.namespace, secret); err != nil {
-		return false, false, err
-	}
-	return isArnExists, true, nil
-}
-
-func (sc *SettingController) removePodsAWSIAMRoleAnnotation() error {
-	managerPods, err := sc.ds.ListManagerPods()
-	if err != nil {
-		return err
-	}
-
-	instanceManagerPods, err := sc.ds.ListInstanceManagerPods()
-	if err != nil {
-		return err
-	}
-	pods := append(managerPods, instanceManagerPods...)
-
-	for _, pod := range pods {
-		_, exist := pod.Annotations[types.AWSIAMRoleAnnotation]
-		if !exist {
-			continue
-		}
-		delete(pod.Annotations, types.AWSIAMRoleAnnotation)
-		sc.logger.Infof("Removing AWS IAM role for pod %v", pod.Name)
-		if _, err := sc.ds.UpdatePod(pod); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return err
-		}
-	}
-	return nil
-}
-
 // updateTaintToleration deletes all user-deployed and system-managed components immediately with the updated taint toleration.
 func (sc *SettingController) updateTaintToleration() error {
 	setting, err := sc.ds.GetSettingWithAutoFillingRO(types.SettingNameTaintToleration)
@@ -642,7 +421,7 @@ func (sc *SettingController) updateTaintToleration() error {
 		return nil
 	}
 
-	detached, _, err := sc.ds.AreAllVolumesDetached(longhorn.DataEngineTypeAll)
+	detached, err := sc.ds.AreAllVolumesDetachedState()
 	if err != nil {
 		return errors.Wrapf(err, "failed to check volume detachment for %v setting update", types.SettingNameTaintToleration)
 	}
@@ -813,7 +592,7 @@ func (sc *SettingController) updatePriorityClass() error {
 		return nil
 	}
 
-	detached, _, err := sc.ds.AreAllVolumesDetached(longhorn.DataEngineTypeAll)
+	detached, err := sc.ds.AreAllVolumesDetachedState()
 	if err != nil {
 		return errors.Wrapf(err, "failed to check volume detachment for %v setting update", types.SettingNamePriorityClass)
 	}
@@ -1070,7 +849,7 @@ func (sc *SettingController) updateLogLevel(settingName types.SettingName) error
 		return err
 	}
 	if oldLevel != newLevel {
-		logrus.Infof("Updating log level from %v to %v", oldLevel, newLevel)
+		logrus.Warnf("Updating log level from %v to %v", oldLevel, newLevel)
 		logrus.SetLevel(newLevel)
 	}
 
@@ -1214,7 +993,7 @@ func (sc *SettingController) updateNodeSelector() error {
 		return nil
 	}
 
-	detached, _, err := sc.ds.AreAllVolumesDetached(longhorn.DataEngineTypeAll)
+	detached, err := sc.ds.AreAllVolumesDetachedState()
 	if err != nil {
 		return errors.Wrapf(err, "failed to check volume detachment for %v setting update", types.SettingNameSystemManagedComponentsNodeSelector)
 	}
@@ -1282,42 +1061,6 @@ func getNotUpdatedNodeSelectorList(newNodeSelector map[string]string, objs ...ru
 	}
 
 	return notUpdatedObjsList, nil
-}
-
-func (bst *BackupStoreTimer) Start() {
-	if bst == nil {
-		return
-	}
-	log := bst.logger.WithFields(logrus.Fields{
-		"interval": bst.pollInterval,
-	})
-	log.Info("Starting backup store timer")
-
-	if err := wait.PollUntilContextCancel(bst.ctx, bst.pollInterval, false, func(context.Context) (done bool, err error) {
-		backupTarget, err := bst.ds.GetBackupTarget(types.DefaultBackupTargetName)
-		if err != nil {
-			log.WithError(err).Errorf("Failed to get %s backup target", types.DefaultBackupTargetName)
-			return false, err
-		}
-
-		log.Debug("Triggering sync backup target")
-		backupTarget.Spec.SyncRequestedAt = metav1.Time{Time: time.Now().UTC()}
-		if _, err = bst.ds.UpdateBackupTarget(backupTarget); err != nil && !apierrors.IsConflict(errors.Cause(err)) {
-			log.WithError(err).Warn("Failed to updating backup target")
-		}
-		return false, nil
-	}); err != nil {
-		log.WithError(err).Error("Failed to sync backup target")
-	}
-
-	log.Infof("Stopped backup store timer")
-}
-
-func (bst *BackupStoreTimer) Stop() {
-	if bst == nil {
-		return
-	}
-	bst.cancel()
 }
 
 func (sc *SettingController) syncUpgradeChecker() error {
@@ -1413,7 +1156,13 @@ func (sc *SettingController) CheckLatestAndStableLonghornVersions() (string, str
 	if err := json.NewEncoder(&content).Encode(req); err != nil {
 		return "", "", err
 	}
-	r, err := http.Post(checkUpgradeURL, "application/json", &content)
+
+	upgradeResponderURL, err := sc.ds.GetSettingValueExisted(types.SettingNameUpgradeResponderURL)
+	if err != nil {
+		return "", "", err
+	}
+
+	r, err := http.Post(upgradeResponderURL, "application/json", &content)
 	if err != nil {
 		return "", "", err
 	}
@@ -1468,20 +1217,12 @@ func (sc *SettingController) enqueueSettingForNode(obj interface{}) {
 	}
 
 	sc.queue.Add(sc.namespace + "/" + string(types.SettingNameGuaranteedInstanceManagerCPU))
-	sc.queue.Add(sc.namespace + "/" + string(types.SettingNameBackupTarget))
-}
-
-func (sc *SettingController) enqueueSettingForBackupTarget(obj interface{}) {
-	if _, ok := obj.(*longhorn.BackupTarget); !ok {
-		return
-	}
-	sc.queue.Add(sc.namespace + "/" + string(types.SettingNameBackupTarget))
 }
 
 // updateInstanceManagerCPURequest deletes all instance manager pods immediately with the updated CPU request.
 func (sc *SettingController) updateInstanceManagerCPURequest(dataEngine longhorn.DataEngineType) error {
 	settingName := types.SettingNameGuaranteedInstanceManagerCPU
-	if dataEngine == longhorn.DataEngineTypeV2 {
+	if types.IsDataEngineV2(dataEngine) {
 		settingName = types.SettingNameV2DataEngineGuaranteedInstanceManagerCPU
 	}
 	imPodList, err := sc.ds.ListInstanceManagerPodsBy("", "", longhorn.InstanceManagerTypeAllInOne, dataEngine)
@@ -1522,12 +1263,12 @@ func (sc *SettingController) updateInstanceManagerCPURequest(dataEngine longhorn
 		return nil
 	}
 
-	detached, _, err := sc.ds.AreAllVolumesDetached(dataEngine)
+	stopped, _, err := sc.ds.AreAllEngineInstancesStopped(dataEngine)
 	if err != nil {
-		return errors.Wrapf(err, "failed to check volume detachment for %v setting update", settingName)
+		return errors.Wrapf(err, "failed to check engine instances for %v setting update", settingName)
 	}
-	if !detached {
-		return &types.ErrorInvalidState{Reason: fmt.Sprintf("failed to apply %v setting to Longhorn components when there are attached volumes. It will be eventually applied", settingName)}
+	if !stopped {
+		return &types.ErrorInvalidState{Reason: fmt.Sprintf("failed to apply %v setting to Longhorn components when there are running engine instances. It will be eventually applied", settingName)}
 	}
 
 	for _, pod := range notUpdatedPods {
@@ -1806,7 +1547,6 @@ func (info *ClusterInfo) collectSettings() error {
 		types.SettingNameBackingImageCleanupWaitInterval:                          true,
 		types.SettingNameBackingImageRecoveryWaitInterval:                         true,
 		types.SettingNameBackupCompressionMethod:                                  true,
-		types.SettingNameBackupstorePollInterval:                                  true,
 		types.SettingNameBackupConcurrentLimit:                                    true,
 		types.SettingNameConcurrentAutomaticEngineUpgradePerNodeLimit:             true,
 		types.SettingNameConcurrentBackupRestorePerNodeLimit:                      true,
@@ -1864,10 +1604,6 @@ func (info *ClusterInfo) collectSettings() error {
 		settingName := types.SettingName(setting.Name)
 
 		switch {
-		// Setting that require extra processing to identify their general purpose
-		case settingName == types.SettingNameBackupTarget:
-			settingMap[setting.Name] = types.GetBackupTargetSchemeFromURL(setting.Value)
-
 		// Setting that should be collected as boolean (true if configured, false if not)
 		case includeAsBoolean[settingName]:
 			definition, ok := types.GetSettingDefinition(types.SettingName(setting.Name))
@@ -1929,7 +1665,7 @@ func (info *ClusterInfo) collectVolumesInfo() error {
 	volumeCount := len(volumesRO)
 	volumeCountV1 := 0
 	for _, volume := range volumesRO {
-		if volume.Spec.DataEngine == longhorn.DataEngineTypeV1 {
+		if types.IsDataEngineV1(volume.Spec.DataEngine) {
 			volumeCountV1++
 		}
 	}
